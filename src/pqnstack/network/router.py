@@ -15,11 +15,11 @@ class Router(NetworkElement):
     def config(self, specs: dict) -> None:
         self.__class = NetworkElementClass.ROUTER
 
-    def exec(self) -> dict:
+    def exec(self) -> None | dict:
         pass
 
     def stop(self) -> None:
         pass
 
-    def dispatch(self, packet: Packet) -> dict:
+    def dispatch(self, packet: Packet) -> None | dict:
         pass

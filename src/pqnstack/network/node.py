@@ -4,6 +4,7 @@
 # NCSA/Illinois Computes
 from abc import abstractmethod
 
+from pqnstack.base.driver import DeviceDriver
 from pqnstack.base.network import NetworkElement
 from pqnstack.network.packet import Packet
 
@@ -11,10 +12,10 @@ from pqnstack.network.packet import Packet
 class Node(NetworkElement):
     def __init__(self, specs: dict) -> None:
         super().__init__(specs)
-        self.drivers = {}
+        self.drivers: dict[str, DeviceDriver] = {}
         self.setup(specs)
 
-    def exec(self) -> dict:
+    def exec(self) -> None | dict:
         pass
 
     def stop(self) -> None:
@@ -40,7 +41,7 @@ class Node(NetworkElement):
         pass
 
     @abstractmethod
-    def call(self) -> dict:
+    def call(self) -> None | dict:
         pass
 
     @abstractmethod
@@ -49,4 +50,5 @@ class Node(NetworkElement):
 
     @abstractmethod
     def collect(self) -> Packet:
-        pass
+        # FIXME: This is a placeholder packet
+        return Packet("", "", (-1, -1), (-1, -1), -1, -1)
