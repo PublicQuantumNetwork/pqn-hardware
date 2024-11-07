@@ -4,17 +4,11 @@
 # NCSA/Illinois Computes
 from abc import ABC
 from abc import abstractmethod
-from enum import Enum
 
 import zmq
 
+from pqnstack.network.packet import NetworkElementClass
 from pqnstack.network.packet import Packet
-
-
-class NetworkElementClass(Enum):
-    ROUTER = 0
-    NODE = 1
-    TELEMETRY = 2
 
 
 class NetworkElement(ABC):
@@ -36,14 +30,6 @@ class NetworkElement(ABC):
             self.__socket.bind(f"tcp://*:{self.__router_port}")
         else:
             self.__socket.bind(f"tcp://{self.__router_ip}:{self.__router_port}")
-
-        # After housekeeping, go into idle mode
-        self.idle()
-
-    def idle(self) -> None:
-        while True:
-            packet = Packet.from_json(self.__socket.recv())
-            self.dispatch(packet)
 
     @abstractmethod
     def setup(self, specs: dict) -> None:

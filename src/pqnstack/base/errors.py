@@ -32,3 +32,11 @@ class LogDecoratorOutsideOfClassError(Exception):
     def __init__(self, message: str = "Log decorator used outside of a class") -> None:
         self.message = message
         super().__init__(self.message)
+
+
+class PacketError(Exception):
+    def __init__(self, message: str = "Packet error") -> None:
+        self.message = message
+        super().__init__(self.message)
+
+
