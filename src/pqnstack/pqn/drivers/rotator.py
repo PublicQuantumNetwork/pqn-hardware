@@ -7,6 +7,7 @@ import logging
 import time
 from abc import abstractmethod
 from dataclasses import dataclass
+from typing import Any
 
 from thorlabs_apt_device import TDC001
 
@@ -26,13 +27,13 @@ class RotatorInfo(DeviceInfo):
     offset_degrees: float
     degrees: float
     encoder_units_per_degree: float | None = None
-    rotator_status: dict | None = None
+    rotator_status: dict[str, Any] | None = None
 
 
 class Rotator(DeviceDriver):
     DEVICE_CLASS = DeviceClass.MOTOR
 
-    def __init__(self, name: str, desc: str, address: str, *args, **kwargs) -> None:
+    def __init__(self, name: str, desc: str, address: str) -> None:
         super().__init__(name, desc, address)
 
         self.operations["move_to"] = self.move_to
@@ -60,7 +61,7 @@ class Rotator(DeviceDriver):
 
 class APTRotator(Rotator):
     def __init__(
-        self, name: str, desc: str, address: str, offset_degrees: float = 0.0, block_while_moving: bool = True
+        self, name: str, desc: str, address: str, offset_degrees: float = 0.0, *, block_while_moving: bool = True
     ) -> None:
         super().__init__(name, desc, address)
 
@@ -125,7 +126,7 @@ class APTRotator(Rotator):
             ):
                 continue
         except KeyboardInterrupt:
-            self._device.stop(True)
+            self._device.stop(immediate=True)
 
     @property
     @log_parameter

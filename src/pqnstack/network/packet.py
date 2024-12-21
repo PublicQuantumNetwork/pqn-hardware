@@ -7,6 +7,7 @@
 from dataclasses import dataclass
 from enum import Enum
 from enum import auto
+from typing import Any
 
 from pqnstack.base.errors import PacketError
 
@@ -20,7 +21,7 @@ class NetworkElementClass(Enum):
 
 class PacketIntent(Enum):
     DATA = auto()
-    OPERATION = auto()
+    PROTOCOL = auto()
     CONTROL = auto()
     REGISTRATION = auto()
     REGISTRATION_ACK = auto()
@@ -35,7 +36,7 @@ class Packet:
     request: str
     source: str
     destination: str
-    payload: object
+    payload: object = None
     hops: int = 0
     version: int = 1
 
@@ -46,7 +47,7 @@ class Packet:
         return self.source, self.destination
 
 
-def create_registration_packet(**kwargs) -> Packet:
+def create_registration_packet(**kwargs: Any) -> Packet:
     if "payload" not in kwargs:
         msg = "payload argument not present when creating registration packet."
         raise PacketError(msg)

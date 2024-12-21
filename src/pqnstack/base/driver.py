@@ -14,6 +14,8 @@ from enum import Enum
 from enum import StrEnum
 from enum import auto
 from functools import wraps
+from time import perf_counter
+from typing import Any
 
 from pqnstack.base.errors import LogDecoratorOutsideOfClassError
 
@@ -25,6 +27,7 @@ class DeviceClass(Enum):
     MOTOR = auto()
     TEMPCTRL = auto()
     TIMETAGR = auto()
+    PROXY = auto()
     TESTING = auto()
 
 
@@ -45,6 +48,17 @@ class DeviceInfo:
 
 
 class DeviceDriver(ABC):
+    """
+    Base class for all drivers in the PQN stack.
+
+    Some rules for drivers:
+
+      * You cannot use the character `:` in the names of instruments. This is used to separate parts of requests in
+        proxy instruments.
+
+
+    """
+
     DEVICE_CLASS: DeviceClass = DeviceClass.TESTING
 
     def __init__(self, name: str, desc: str, address: str) -> None:
@@ -56,7 +70,7 @@ class DeviceDriver(ABC):
 
         self.parameters: set[str] = set()
         # FIXME: operations is overloaded with the big operations of the system. We should make it mean single thing.
-        self.operations: dict[str, Callable] = {}
+        self.operations: dict[str, Callable[[Any], Any]] = {}
 
         atexit.register(self.close)
 
@@ -69,10 +83,13 @@ class DeviceDriver(ABC):
     @abstractmethod
     def close(self) -> None: ...
 
+    def __setattr__(self, key: str, value: Any) -> None:
+        super().__setattr__(key, value)
 
-def log_operation(func: Callable) -> Callable:
+
+def log_operation[T](func: Callable[..., T]) -> Callable[..., T]:
     @wraps(func)
-    def wrapper(*args: tuple, **kwargs: dict) -> Callable:
+    def wrapper(*args: Any, **kwargs: Any) -> T:
         if len(args) == 0:
             msg = "log_operation has 0 args, this usually indicates that it has been used to decorate something that is not a class method. This is not allowed."
             raise LogDecoratorOutsideOfClassError(msg)
@@ -82,7 +99,7 @@ def log_operation(func: Callable) -> Callable:
             msg = "log_operation has been used to decorate something that is not a DeviceDriver method. This is not allowed."
             raise LogDecoratorOutsideOfClassError(msg)
 
-        start_time = datetime.datetime.now(tz=datetime.UTC)
+        start_time = perf_counter()
         logger.info(
             "%s| %s, %s |Starting operation '%s' with args: '%s' and kwargs '%s'",
             start_time,
@@ -95,10 +112,15 @@ def log_operation(func: Callable) -> Callable:
 
         result = func(*args, **kwargs)
 
-        end_time = datetime.datetime.now(tz=datetime.UTC)
+        end_time = perf_counter()
         duration = end_time - start_time
         logger.info(
-            "%s | %s, %s | Completed operation %s. Duration: %s", end_time, ins.name, type(ins), func.__name__, duration
+            "%s | %s, %s | Completed operation %s. Duration: %s",
+            end_time,
+            ins.name,
+            type(ins),
+            func.__name__,
+            duration,
         )
 
         return result
@@ -106,9 +128,9 @@ def log_operation(func: Callable) -> Callable:
     return wrapper
 
 
-def log_parameter(func: Callable) -> Callable:
+def log_parameter[T](func: Callable[..., T]) -> Callable[..., T]:
     @wraps(func)
-    def wrapper(*args: tuple, **kwargs: dict) -> Callable:
+    def wrapper(*args: Any, **kwargs: Any) -> T:
         if len(args) == 0:
             msg = (
                 "log_parameter has 0 args, "
@@ -139,9 +161,9 @@ def log_parameter(func: Callable) -> Callable:
             )
 
         else:
-            start_time = datetime.datetime.now(tz=datetime.UTC)
+            start_time = perf_counter()
             result = func(*args, **kwargs)  # Always return None
-            end_time = datetime.datetime.now(tz=datetime.UTC)
+            end_time = perf_counter()
             duration = end_time - start_time
             logger.info(
                 "%s | %s, %s | Parameter '%s' got updated to '%s', parameter update took %s long ",
