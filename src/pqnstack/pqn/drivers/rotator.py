@@ -3,12 +3,15 @@
 #
 # NCSA/Illinois Computes
 
+import atexit
 import logging
 import time
 from abc import abstractmethod
 from dataclasses import dataclass
+from dataclasses import field
 from typing import Any
 
+import serial
 from thorlabs_apt_device import TDC001
 
 from pqnstack.base.driver import DeviceClass
@@ -30,7 +33,7 @@ class RotatorInfo(DeviceInfo):
     rotator_status: dict[str, Any] | None = None
 
 
-class Rotator(DeviceDriver):
+class RotatorDevice(DeviceDriver):
     DEVICE_CLASS = DeviceClass.MOTOR
 
     def __init__(self, name: str, desc: str, address: str) -> None:
@@ -59,7 +62,7 @@ class Rotator(DeviceDriver):
     def start(self) -> None: ...
 
 
-class APTRotator(Rotator):
+class APTRotatorDevice(RotatorDevice):
     def __init__(
         self, name: str, desc: str, address: str, offset_degrees: float = 0.0, *, block_while_moving: bool = True
     ) -> None:
@@ -146,3 +149,64 @@ class APTRotator(Rotator):
         if self.block_while_moving:
             self._wait_for_stop()
         self.status = DeviceStatus.READY
+
+
+@dataclass(slots=True)
+class SerialRotator:
+    label: str
+    address: str
+    offset_degrees: float = 0.0
+    _degrees: float = 0.0  # The hardware doesn't support position tracking
+    _controller: serial.Serial = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._controller = serial.Serial(self.address, baudrate=115200, timeout=1)
+        self._controller.write(b"open_channel")
+        self._controller.read(100)
+        self._controller.write(b"motor_ready")
+        self._controller.read(100)
+
+        self.degrees = self.offset_degrees
+        atexit.register(self.cleanup)
+
+    def cleanup(self) -> None:
+        self.degrees = 0
+        self._controller.close()
+
+    @property
+    def degrees(self) -> float:
+        return self._degrees
+
+    @degrees.setter
+    def degrees(self, degrees: float) -> None:
+        self._controller.write(f"SRA {degrees}".encode())
+        self._degrees = degrees
+        _ = self._controller.readline().decode()
+
+
+class SerialRotatorDevice(RotatorDevice):
+    def __init__(self, name: str, desc: str, address: str, hb_rotator: SerialRotator):
+        super().__init__(name, desc, address)
+        self.hb_rotator = hb_rotator
+
+    def info(self) -> DeviceInfo:
+        return DeviceInfo(
+            name=self.name, desc=self.desc, dtype=self.DEVICE_CLASS, status=self.status, address=self.address
+        )
+
+    def start(self) -> None:
+        self.status = DeviceStatus.READY
+
+    def close(self) -> None:
+        self.status = DeviceStatus.OFF
+        return self.hb_rotator.cleanup()
+
+    @property
+    @log_parameter
+    def degrees(self) -> float:
+        return self.hb_rotator.degrees
+
+    @degrees.setter
+    @log_parameter
+    def degrees(self, degrees: float) -> None:
+        self.hb_rotator.degrees = degrees
