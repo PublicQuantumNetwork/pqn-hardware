@@ -4,7 +4,9 @@ from time import sleep
 
 import numpy as np
 
-from pqnstack.base.driver.rotator import RotatorDevice
+from pqnstack.pqn.driver.rotator import RotatorDevice
+from pqnstack.pqn.drivers.timetagger import MeasurementConfig
+from pqnstack.pqn.drivers.timetagger import TimeTaggerDevice
 
 
 @dataclass
@@ -13,16 +15,7 @@ class Devices:
     idler_qwp: RotatorDevice
     signal_hwp: RotatorDevice
     signal_qwp: RotatorDevice
-    timetagger: RotatorDevice
-
-
-@dataclass
-class MeasurementConfig:
-    duration: float
-    binwidth: float = 500e-12
-    channel1: int = 1
-    channel2: int = 2
-    dark_count: int = 0
+    timetagger: TimeTaggerDevice
 
 
 @dataclass
@@ -51,9 +44,21 @@ def basis_to_wp(basis: float) -> list[float]:
     return [basis / 2, 0.0]  # TODO: Make input a complex number and have the quarter waveplate angle calculated from it
 
 
-def expectation_value(
+@dataclass
+class ExpectationValue:
+    timestamp: str
+    input_base1: float
+    input_base2: float
+    idler_wp_angles: list[list[float]]
+    signal_wp_angles: list[list[float]]
+    raw_counts: list[int]
+    error: float
+    value: float
+
+
+def measure_expectation_value(
     devices: Devices, config: MeasurementConfig, base1: float, base2: float
-) -> tuple[float, float, dict[str, object]]:
+) -> ExpectationValue:
     idler_wp_angles = basis_to_wp(base1)
     signal_wp_angles = basis_to_wp(base2)
 
@@ -69,7 +74,7 @@ def expectation_value(
             devices.signal_qwp.move_to(angle_signal[1])
             sleep(2)
             counts = devices.timetagger.measure_coincidence(
-                config.channel1, config.channel2, int(config.binwidth * 1e12), int(config.duration * 1e12)
+                config.channel1, config.channel2, int(config.binwidth), int(config.duration * 1e12)
             )
             coincidence_counts.append(counts)
 
@@ -78,43 +83,48 @@ def expectation_value(
     expectation_val = numerator / denominator
     expectation_error = calculate_chsh_expectation_error(coincidence_counts, config.dark_count)
 
-    raw_results = {
-        "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
-        "input_base1": base1,
-        "input_base2": base2,
-        "idler_wp_angles": angles_idler,
-        "signal_wp_angles": angles_signal,
-        "raw_counts": coincidence_counts,
-        "raw_error": expectation_error,
-    }
+    return ExpectationValue(
+        timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
+        input_base1=base1,
+        input_base2=base2,
+        idler_wp_angles=angles_idler,
+        signal_wp_angles=angles_signal,
+        raw_counts=coincidence_counts,
+        error=expectation_error,
+        value=expectation_val,
+    )
 
-    return float(expectation_val), expectation_error, raw_results
+
+@dataclass
+class CHSHValue:
+    timestamp: str
+    raw_results: list[ExpectationValue]
+    basis1: list[float]
+    basis2: list[float]
+    chsh_value: float
+    chsh_error: float
 
 
-def measure_chsh(
-    basis1: list[float], basis2: list[float], devices: Devices, config: MeasurementConfig
-) -> dict[str, object]:
+def measure_chsh(basis1: list[float], basis2: list[float], devices: Devices, config: MeasurementConfig) -> CHSHValue:
     expectation_values = []
     expectation_errors = []
     raw_results = []
 
     for base1 in basis1:
         for base2 in basis2:
-            exp_val, exp_err, raw = expectation_value(devices, config, base1, base2)
-            expectation_values.append(exp_val)
-            expectation_errors.append(exp_err)
+            raw = measure_expectation_value(devices, config, base1, base2)
+            expectation_values.append(raw.value)
+            expectation_errors.append(raw.error)
             raw_results.append(raw)
 
     chsh_value = -1 * expectation_values[0] + expectation_values[1] + expectation_values[2] + expectation_values[3]
     chsh_error = calculate_chsh_error(expectation_errors)
 
-    return {
-        "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
-        "raw_results": raw_results,
-        "expectation_values": expectation_values,
-        "expectation_errors": expectation_errors,
-        "basis1": basis1,
-        "basis2": basis2,
-        "chsh_value": chsh_value,
-        "chsh_error": chsh_error,
-    }
+    return CHSHValue(
+        timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
+        raw_results=raw_results,
+        basis1=basis1,
+        basis2=basis2,
+        chsh_value=chsh_value,
+        chsh_error=chsh_error,
+    )

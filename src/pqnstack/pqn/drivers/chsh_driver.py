@@ -10,8 +10,9 @@ from pqnstack.base.driver import DeviceInfo
 from pqnstack.base.driver import DeviceStatus
 from pqnstack.base.driver import log_operation
 from pqnstack.network.client import Client
+from pqnstack.pqn.drivers.timetagger import MeasurementConfig
+from pqnstack.pqn.protocols.chsh import CHSHValue
 from pqnstack.pqn.protocols.chsh import Devices
-from pqnstack.pqn.protocols.chsh import MeasurementConfig
 from pqnstack.pqn.protocols.chsh import measure_chsh
 
 logger = logging.getLogger(__name__)
@@ -70,7 +71,7 @@ class CHSHDevice(DeviceDriver):
     @log_operation
     def measure_chsh(
         self, basis1: list[float], basis2: list[float], devices: Devices, config: MeasurementConfig
-    ) -> dict[str, object]:
+    ) -> CHSHValue:
         result_holder = {"success": False, "value": None}
 
         self.queue_length += 1
@@ -84,5 +85,5 @@ class CHSHDevice(DeviceDriver):
 
         self.queue_length -= 1
 
-        kwargs = cast(dict[str, Any], request["kwargs"])
+        kwargs = cast("dict[str, Any]", request["kwargs"])
         return measure_chsh(**kwargs)

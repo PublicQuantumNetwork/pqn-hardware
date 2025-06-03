@@ -27,6 +27,15 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class MeasurementConfig:
+    duration: int  # in picoseconds
+    binwidth: int = 500  # in picoseconds
+    channel1: int = 1
+    channel2: int = 2
+    dark_count: int = 0
+
+
+@dataclass
 class TimeTaggerInfo(DeviceInfo):
     """Metadata and current state information for the time tagger device."""
 
@@ -66,6 +75,14 @@ class TimeTaggerDevice(DeviceDriver):
         #        self, groups: list[tuple[int, ...]], measurement_time: float = 5.0, coincidence_window_ps: int = 10000
         #    ) -> None:
         """Perform a coincidence-counting measurement on a given list of channel groups, for the specified real-time measurement duration and coincidence window."""
+
+    @abstractmethod
+    def measure_coincidence(self, channel1: int, channel2: int, binwidth_ps: int, measurement_duration_ps: int) -> int:
+        "Measaures the coincidence between input channels."
+
+    @abstractmethod
+    def measure_countrate(self, channels: list[int], binwidth_ps: int) -> list[int]:
+        "Measaures the singles counts on input channels."
 
 
 class SwabianTimeTagger(TimeTaggerDevice):
@@ -157,11 +174,11 @@ class SwabianTimeTagger(TimeTaggerDevice):
         counter.waitUntilFinished()
         return [item[0] for item in counter.getData()]
 
-    def measure_coincidence(self, channel1: int, channel2: int, binwidth_ps: int, measurement_duration_ps: int) -> Any:
+    def measure_coincidence(self, channel1: int, channel2: int, binwidth_ps: int, measurement_duration_ps: int) -> int:
         corr = Correlation(self._tagger, channel1, channel2, binwidth_ps, n_bins=100000)
         corr.startFor(measurement_duration_ps)
         corr.waitUntilFinished()
-        return np.max(corr.getData())
+        return int(np.max(corr.getData()))
 
     def enable_test_signal(self, *, enabled: bool, test_signal_divider: int = 1) -> None:
         self.enabled = enabled
