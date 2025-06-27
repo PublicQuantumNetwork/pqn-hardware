@@ -16,8 +16,6 @@ authors = [
     { name = "Soroush Hoseini", email = "soroushhoseini0@gmail.com" },
 ]
 dependencies = [
-    "fastapi[standard]>=0.115.14",
-    "httpx>=0.28.1",
     "numpy<2.0",
     "pyfirmata2>=2.5.0",
     "pyzmq>=26.2.0",
@@ -27,6 +25,12 @@ dependencies = [
 
 [project.scripts]
 pqn = "pqnstack.cli:app"
+
+[project.optional-dependencies]
+webapp = [
+    "fastapi>=0.115.14",
+    "httpx>=0.28.1",
+]
 
 [dependency-groups]
 dev = ["mypy>=1.13.0", "pytest-cov>=6.0.0", "ruff>=0.8.0"]
