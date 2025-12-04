@@ -50,12 +50,12 @@ class ClientBase:
 
         self.connect()
 
-    def __enter__(self) -> Self:
+    async def __aenter__(self) -> Self:
         if not self.connected:
             self.connect()
         return self
 
-    def __exit__(
+    async def __aexit__(
         self, exc_type: type[BaseException] | None, exc_val: BaseException | None, exc_tb: TracebackType | None
     ) -> None:
         self.disconnect()
@@ -288,7 +288,7 @@ class Client(ClientBase):
 
         return response.payload
 
-    def get_device(self, provider_name: str, device_name: str) -> Instrument:
+    def get_device(self, provider_name: str, device_name: str, timeout_ms: int = 60_000) -> Instrument:
         packet = self.create_data_packet(provider_name, "GET_DEVICE_STRUCTURE", device_name)
 
         response = self.ask(packet)
@@ -311,7 +311,7 @@ class Client(ClientBase):
             host=self.host,
             port=self.port,
             router_name=self.router_name,
-            timeout_ms=self.timeout,
+            timeout_ms=timeout_ms,
             instrument_name=response.payload["name"],
             provider_name=provider_name,
             parameters=set(response.payload["parameters"]),
