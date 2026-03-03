@@ -2,7 +2,7 @@
 
 Building a public quantum network occurs in three main phases:
 1. Form your team. Decide on where you’d like the entanglement source and public node to be (should be within a ~5 mile radius). Reach out to the public node building administration to gauge interest. Identify researchers familiar with quantum optics to help set up the network components.
-2. Find your fiber. Reach out to relevant optical fiber companies / organizations to determine what fibers are available between the nodes and characterize loss, etc. Typical values are below.
+2. Connect fiber links and characterize them. Reach out to relevant optical fiber companies / organizations to determine what fibers are available between the nodes and characterize loss, etc. Typical values are below.
 3. Assemble and install your components. Below are the bill of materials and general setup procedures.
 
 ##Bill of Materials
