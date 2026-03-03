@@ -7,17 +7,17 @@ Building a public quantum network occurs in three main phases:
 
 ## Bill of Materials
 
-General Supplies | $256
+| General Supplies | $256 |
 
-Public Interface | $1,137
+| Public Interface | $1,137 | 
 
-Rack-mountable Measurement System for Network Closet | $3,643
+| Rack-mountable Measurement System for Network Closet | $3,643 | 
 
-Entanglement Source | $56,164
+| Entanglement Source | $56,164 | 
 
-Detectors | $30,000
+| Detectors | $30,000 | 
 
-Total | $91,200
+| Total | $91,200 |
 
 ## Characterizing Fiber Links
 *We use dark fibers (fibers not being used for data). We are studying how to send quantum signals over fibers already in use for classical communication (so-called quantum-classical co-existence).
