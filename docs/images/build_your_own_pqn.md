@@ -6,7 +6,7 @@ Building a public quantum network occurs in three main phases:
 3. Launch and maintain the public quantum network. Prepare a launch event and ongoing outreach activities for the public. Please consider sharing your updates, modifications, and outreach materials with the overall PQN effort -- we aim to build a friendly, open-source community!
 
 ## Bill of Materials
-Below are estimates; we are constantly working to reduce the cost of components.
+Below are estimates; we are constantly working to reduce the cost of components, such as by creating new entanglement source designs and 3D-printing components.
 | Components | Price |
 |------------|------------|
 | General Supplies | $256 |
@@ -17,10 +17,10 @@ Below are estimates; we are constantly working to reduce the cost of components.
 | Total | $91,200 |
 
 ## Characterizing Fiber Links
-*We use dark fibers (fibers not being used for data). We are studying how to send quantum signals over fibers already in use for classical communication (so-called quantum-classical co-existence).
-*Fiber-related costs may include a non-recurring engineering fee to get the dark fiber from the lab to the public space (~$20k typical) and fees for continued use.
-*Typical loss and dark counts for 24.3-km roundtrip fiber: ~10-dB loss at 1550 nm and ~1,500 cps dark counts 
-*Typically, polarization drift requires daily compensation; we are working on automating this.
+* We use dark fibers (fibers not being used for data). We are studying how to send quantum signals over fibers already in use for classical communication (so-called quantum-classical co-existence).
+* Fiber-related costs may include a non-recurring engineering fee to get the dark fiber from the lab to the public space (~$20k typical) and fees for continued use.
+* Typical loss and dark counts for 24.3-km roundtrip fiber: ~10-dB loss at 1550 nm and ~1,500 cps dark counts 
+* Typically, polarization drift requires daily compensation; we are working on automating this.
 
 ## Setting up PQN Hardware
 
