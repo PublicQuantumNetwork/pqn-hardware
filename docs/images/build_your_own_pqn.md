@@ -1,9 +1,9 @@
 # How to build your own PQN
 
 Building a public quantum network occurs in three main phases:
-1. Form your team. Decide on where you’d like the entanglement source and public node to be (should be within a ~5 mile radius). Reach out to the public node building administration to gauge interest. Identify researchers familiar with quantum optics to help set up the network components.
-2. Connect fiber links and characterize them. Reach out to relevant optical fiber companies / organizations to determine what fibers are available between the nodes and characterize loss, etc. Typical values are below.
-3. Assemble and install your components. Below are the bill of materials and general setup procedures.
+1. Form your team. Decide on where you’d like the entanglement source and public node to be (should be within a ~5 mile radius). Reach out to the public node building administration to gauge interest. Reach out to relevant optical fiber companies / organizations to determine what fibers are available between the nodes. Identify and reach out to researchers familiar with quantum optics to help set up the network components. 
+2. Build and test hardware. Connect fiber links and characterize them. Typical values are below. Assemble and install your components. Below are the bill of materials and general setup procedures.
+3. Launch and maintain the public quantum network. Prepare a launch event and ongoing outreach activiites for the public. Share your updates, modifications, and outreach materials with the overall PQN effort.
 
 ## Bill of Materials
 Below are estimates; we are constantly working to reduce the cost of components.
