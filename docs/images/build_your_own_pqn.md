@@ -6,15 +6,15 @@ Building a public quantum network occurs in three main phases:
 3. Launch and maintain the public quantum network. Prepare a launch event and ongoing outreach activities for the public. Please consider sharing your updates, modifications, and outreach materials with the overall PQN effort -- we aim to build a friendly, open-source community!
 
 ## Bill of Materials
-Below are estimates; we are constantly working to reduce the cost of components, such as by creating new entanglement source designs and 3D-printing components.
+We are constantly working to reduce the cost of components, such as by creating new entanglement source designs and 3D-printing components. The following prices are ballpark estimates.
 | Components | Price |
 |------------|------------|
-| General Supplies | $256 |
-| Public Interface | $1,137 | 
-| Rack-mountable Measurement System for Network Closet | $3,643 | 
-| Entanglement Source | $56,164 | 
+| General Supplies | $300 |
+| Public Interface | $1,000 | 
+| Rack-mountable Measurement System for Network Closet | $4,000 | 
+| Entanglement Source | $56,000 | 
 | Detectors | $30,000 | 
-| Total | $91,200 |
+| Total | $91,300 |
 
 ## Characterizing Fiber Links
 * We use dark fibers (fibers not being used for data). We are studying how to send quantum signals over fibers already in use for classical communication (so-called quantum-classical co-existence).
@@ -25,6 +25,8 @@ Below are estimates; we are constantly working to reduce the cost of components,
 ## Setting up PQN Hardware
 
 There are three main parts to PQN hardware: the entanglement source, the public interface, and the measurement system. Telecom photons from the entanglement source are sent through the fiber loop to the public node. At the public node, the user chooses measurement settings using the public interface. These settings are applied to a measurement system inside the network closet through which the photons pass.
+
+We are developing hardware and assembly instructions so that anyone can build their own components. If you would like to learn more, please reach out!
 
 ## Setting up PQN Software
 
