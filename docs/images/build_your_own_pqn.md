@@ -24,7 +24,7 @@ The following prices are ballpark estimates. We are constantly working to reduce
 
 ## Setting up PQN Hardware
 
-There are three main parts to PQN hardware: the entanglement source, the public interface, and the measurement system. Telecom photons from the entanglement source are sent through the fiber loop to the public node. At the public node, the user chooses measurement settings using the public interface. These settings are applied to a measurement system inside the network closet through which the photons pass.
+There are three main parts to PQN hardware: the entanglement source, the public interface, and the measurement system. Telecom photons from the entanglement source are sent through the fiber loop to the public node. At the public node, the user chooses measurement settings using the public interface. These settings are applied to a measurement system inside the network closet through which the photons pass. For technical details, please see our research article, [Public quantum network: the first node](https://doi.org/10.1063/5.0241562).
 
 We are developing hardware and assembly instructions so that anyone can build their own components. If you would like to learn more, please reach out!
 
