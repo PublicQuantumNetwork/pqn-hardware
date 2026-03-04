@@ -14,7 +14,7 @@ The following prices are ballpark estimates. We are constantly working to reduce
 | Rack-mountable Measurement System for Network Closet | $4,000 | 
 | Entanglement Source | $56,000 | 
 | Detectors | $30,000 | 
-| Total | $91,300 |
+| **Total** | **$91,300** |
 
 ## Characterizing Fiber Links
 * We use dark fibers (fibers not being used for data). We are studying how to send quantum signals over fibers already in use for classical communication (so-called quantum-classical co-existence).
