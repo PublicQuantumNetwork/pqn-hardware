@@ -16,6 +16,8 @@ The following prices are ballpark estimates. We are constantly working to reduce
 | Detectors | $30,000 | 
 | **Total** | **$91,300** |
 
+If you are adding a node to an already existing network, just a public interface and rack-mountable measurement system are required.
+
 ## Characterizing Fiber Links
 * We use dark fibers (fibers not being used for data). We are studying how to send quantum signals over fibers already in use for classical communication (so-called quantum-classical co-existence).
 * Fiber-related costs may include a non-recurring engineering fee to get the dark fiber from the lab to the public space (~$20k typical) and fees for continued use.
