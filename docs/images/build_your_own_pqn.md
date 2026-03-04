@@ -7,7 +7,8 @@ Building a public quantum network occurs in three main phases:
 
 ## Bill of Materials
 Below are estimates; we are constantly working to reduce the cost of components.
-
+| Components | Price |
+|------------|------------|
 | General Supplies | $256 |
 | Public Interface | $1,137 | 
 | Rack-mountable Measurement System for Network Closet | $3,643 | 
