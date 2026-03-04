@@ -6,7 +6,7 @@ Building a public quantum network occurs in three main phases:
 3. Launch and maintain the public quantum network. Prepare a launch event and ongoing outreach activities for the public. Please consider sharing your updates, modifications, and outreach materials with the overall PQN effort -- we aim to build a friendly, open-source community!
 
 ## Bill of Materials
-We are constantly working to reduce the cost of components, such as by creating new entanglement source designs and 3D-printing components. The following prices are ballpark estimates.
+The following prices are ballpark estimates. We are constantly working to reduce the cost of components, such as by creating new entanglement source designs and 3D-printing components.
 | Components | Price |
 |------------|------------|
 | General Supplies | $300 |
