@@ -11,7 +11,7 @@ The following prices are ballpark estimates. We are constantly working to reduce
 |------------|------------|
 | General Supplies | $300 |
 | Public Interface | $1,000 | 
-| Rack-mountable Measurement System for Network Closet | $4,000 | 
+| Measurement System | $4,000 | 
 | Entanglement Source | $56,000 | 
 | Detectors | $30,000 | 
 | **Total** | **$91,300** |
