@@ -4,9 +4,9 @@ build-backend = "uv_build"
 
 
 [project]
-name = "pqnstack"
+name = "pqn-hardware"
 version = "0.2.0"
-description = "Illinois Computes work on software stack for PQN."
+description = "Hardware control library for the Public Quantum Network."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
@@ -20,15 +20,11 @@ dependencies = [
     "pyfirmata2>=2.5.0",
     "pyzmq>=26.2.0",
     "thorlabs-apt-device>=0.3.8",
-    "tomli-w>=1.0.0",
     "typer>=0.15.1",
-    "fastapi[standard]>=0.115.14",
-    "httpx>=0.28.1",
-    "pydantic-settings>=2.10.1",
 ]
 
 [project.scripts]
-pqn = "pqnstack.cli:app"
+pqn-hw = "pqn_hardware.cli:app"
 
 
 [dependency-groups]
