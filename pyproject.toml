@@ -1,0 +1,101 @@
+[build-system]
+requires = ["uv_build"]
+build-backend = "uv_build"
+
+
+[project]
+name = "pqn-hardware"
+version = "0.2.0"
+description = "Hardware control library for the Public Quantum Network."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [
+    { name = "Benjamin Nussbaum", email = "bn9@illinois.edu" },
+    { name = "Marcos Frenkel", email = "marcosf2@illinois.edu" },
+    { name = "Soroush Hoseini", email = "soroushhoseini0@gmail.com" },
+]
+dependencies = [
+    "numpy>=2.3.5",
+    "pyfirmata2>=2.5.0",
+    "pyzmq>=26.2.0",
+    "thorlabs-apt-device>=0.3.8",
+    "typer>=0.15.1",
+]
+
+[project.scripts]
+pqn-hw = "pqn_hardware.cli:app"
+
+
+[dependency-groups]
+dev = ["hypothesis", "mypy", "coverage", "pytest-randomly", "ruff"]
+
+
+[tool.mypy]
+files = ["src/**/*.py"]
+strict = true
+pretty = true
+
+enable_error_code = ["ignore-without-code"]
+
+ignore_missing_imports = true
+
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+# See https://docs.astral.sh/ruff/rules/ for details.
+select = ["ALL"]
+ignore = [
+    "ANN",  # Let Mypy handle type annotations
+    "D1",   # Don't warn about missing docstrings (but lint the ones that exist)
+    "FIX",  # The linter doesnt need to remind us about TODOs
+    "S301", # We use pickle
+    "TD",   # We don't use this TODO style
+]
+
+# Ignore rules which are redundant when using the formatter.
+# See https://docs.astral.sh/ruff/formatter/#conflicting-lint-rules for details.
+extend-ignore = [
+    "W191",
+    "E111",
+    "E114",
+    "E117",
+    "D206",
+    "D300",
+    "Q",
+    "COM812",
+    "COM819",
+    "ISC001",
+    "ISC002",
+    "E501",
+]
+
+[tool.ruff.lint.extend-per-file-ignores]
+"tests/*" = [
+    "S101", # Assert
+]
+# Run pytest lint rules only in test files.
+"!tests/*" = ["PT"]
+# Allow "unused" imports when exposing objects from submodules.
+"**/__init__.py" = ["F401"]
+
+[tool.ruff.lint.isort]
+force-single-line = true
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy" # One of: "google" | "numpy" | "pep257"
+
+
+[tool.coverage.run]
+# source = ["app"]
+dynamic_context = "test_function"
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true
+sort = "-Cover"
+
+[tool.coverage.html]
+show_contexts = true
