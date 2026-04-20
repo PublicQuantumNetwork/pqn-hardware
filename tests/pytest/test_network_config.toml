@@ -12,12 +12,12 @@ beat_period = 2000
 
 [[provider.instruments]]
 name = "dummy1"
-import = "pqn_hardware.pqn.drivers.dummies.DummyInstrument"
+import = "pqn_hardware.drivers.dummies.DummyInstrument"
 desc = "Dummy instrument1 for testing purposes"
 hw_address = "1234"
 
 [[provider.instruments]]
 name = "dummy2"
-import = "pqn_hardware.pqn.drivers.dummies.DummyInstrument"
+import = "pqn_hardware.drivers.dummies.DummyInstrument"
 desc = "Dummy instrument2 for testing purposes"
 hw_address = "1234"

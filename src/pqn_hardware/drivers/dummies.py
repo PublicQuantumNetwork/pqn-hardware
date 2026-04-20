@@ -1,10 +1,10 @@
 import time
 from dataclasses import dataclass
 
-from pqn_hardware.base.instrument import Instrument
-from pqn_hardware.base.instrument import InstrumentInfo
-from pqn_hardware.base.instrument import log_operation
-from pqn_hardware.base.instrument import log_parameter
+from pqn_hardware.instrument import Instrument
+from pqn_hardware.instrument import InstrumentInfo
+from pqn_hardware.instrument import log_operation
+from pqn_hardware.instrument import log_parameter
 
 
 @dataclass(frozen=True, slots=True)

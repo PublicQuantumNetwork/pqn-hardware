@@ -8,11 +8,11 @@ from typing import Any
 
 import pytest
 
+from pqn_hardware.drivers.dummies import DummyInstrument
 from pqn_hardware.network.client import Client
 from pqn_hardware.network.client import ProxyInstrument
 from pqn_hardware.network.packet import Packet
 from pqn_hardware.network.packet import PacketIntent
-from pqn_hardware.pqn.drivers.dummies import DummyInstrument
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +33,7 @@ def messaging_services() -> Generator[None, Any, None]:
 
     # Start router process
     router_process = subprocess.Popen(  # Noqa: S603 # Subprocess is used for testing purposes, not in production code.
-        [uv_path, "run", "pqn", "start-router", "--config", str(config_path)],
+        [uv_path, "run", "pqn-hw", "start-router", "--config", str(config_path)],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -43,7 +43,7 @@ def messaging_services() -> Generator[None, Any, None]:
 
     # Start provider process
     provider_process = subprocess.Popen(  # Noqa: S603 # Subprocess is used for testing purposes, not in production code.
-        [uv_path, "run", "pqn", "start-provider", "--config", str(config_path)],
+        [uv_path, "run", "pqn-hw", "start-provider", "--config", str(config_path)],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )

@@ -6,7 +6,7 @@ from typing import Annotated
 
 import typer
 
-from pqn_hardware.base.errors import InvalidNetworkConfigurationError
+from pqn_hardware.errors import InvalidNetworkConfigurationError
 from pqn_hardware.network.instrument_provider import InstrumentProvider
 from pqn_hardware.network.router import Router
 

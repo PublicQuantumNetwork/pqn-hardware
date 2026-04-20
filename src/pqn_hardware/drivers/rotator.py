@@ -12,9 +12,9 @@ import serial
 from thorlabs_apt_device import KDC101
 from thorlabs_apt_device import TDC001
 
-from pqn_hardware.base.errors import DeviceNotStartedError
-from pqn_hardware.base.instrument import RotatorInfo
-from pqn_hardware.base.instrument import RotatorInstrument
+from pqn_hardware.errors import DeviceNotStartedError
+from pqn_hardware.instrument import RotatorInfo
+from pqn_hardware.instrument import RotatorInstrument
 
 logger = logging.getLogger(__name__)
 

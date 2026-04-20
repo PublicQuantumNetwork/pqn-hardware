@@ -1,9 +1,3 @@
-# University of Illinois Urbana-Champaign
-# Public Quantum Network
-#
-# NCSA/Illinois Computes
-
-
 class DeviceNotStartedError(Exception):
     def __init__(self, message: str = "Device not started") -> None:
         self.message = message

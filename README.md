@@ -51,7 +51,7 @@ uv run pqn-hw start-provider \
   --instruments '{"dummy1": {"import": "pqn_hardware.pqn.drivers.dummies.DummyInstrument", "desc": "Test Instrument", "hw_address": "123456"}}'
 ```
 
-See [`configs/config_messaging_example.toml`](configs/config_messaging_example.toml) for the full config shape.
+See [`configs/config_messaging_example.toml`](configs/config_example.toml) for the full config shape.
 
 ## Consuming from pqn-node
 

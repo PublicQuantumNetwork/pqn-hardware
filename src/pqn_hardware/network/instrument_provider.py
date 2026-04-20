@@ -6,9 +6,9 @@ from typing import Any
 
 import zmq
 
-from pqn_hardware.base.errors import CouldNotConnectToNetworkElementError
-from pqn_hardware.base.errors import InvalidInstrumentsConfigurationError
-from pqn_hardware.base.instrument import Instrument
+from pqn_hardware.errors import CouldNotConnectToNetworkElementError
+from pqn_hardware.errors import InvalidInstrumentsConfigurationError
+from pqn_hardware.instrument import Instrument
 from pqn_hardware.network.packet import NetworkElementClass
 from pqn_hardware.network.packet import Packet
 from pqn_hardware.network.packet import PacketIntent

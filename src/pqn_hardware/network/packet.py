@@ -1,15 +1,9 @@
-# University of Illinois Urbana-Champaign
-# Public Quantum Network
-#
-# NCSA/Illinois Computes
-#
-#
 from dataclasses import dataclass
 from enum import Enum
 from enum import auto
 from typing import Any
 
-from pqn_hardware.base.errors import PacketError
+from pqn_hardware.errors import PacketError
 
 
 class NetworkElementClass(Enum):

@@ -11,9 +11,9 @@ from typing import Self
 
 import zmq
 
-from pqn_hardware.base.errors import PacketError
-from pqn_hardware.base.instrument import Instrument
-from pqn_hardware.base.instrument import InstrumentInfo
+from pqn_hardware.errors import PacketError
+from pqn_hardware.instrument import Instrument
+from pqn_hardware.instrument import InstrumentInfo
 from pqn_hardware.network.packet import NetworkElementClass
 from pqn_hardware.network.packet import Packet
 from pqn_hardware.network.packet import PacketIntent

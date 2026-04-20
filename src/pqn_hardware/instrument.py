@@ -1,8 +1,3 @@
-# University of Illinois Urbana-Champaign
-# Public Quantum Network
-#
-# NCSA/Illinois Computes
-
 import atexit
 import datetime
 import logging
@@ -15,7 +10,7 @@ from typing import Any
 from typing import Protocol
 from typing import runtime_checkable
 
-from pqn_hardware.base.errors import LogDecoratorOutsideOfClassError
+from pqn_hardware.errors import LogDecoratorOutsideOfClassError
 
 logger = logging.getLogger(__name__)
 
