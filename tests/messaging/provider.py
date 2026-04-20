@@ -1,13 +1,13 @@
 import logging
 
-from pqnstack.network.instrument_provider import InstrumentProvider
+from pqn_hardware.network.instrument_provider import InstrumentProvider
 
 logging.basicConfig(level=logging.INFO)
 
 if __name__ == "__main__":
     instruments = {
         "dummy1": {
-            "import": "pqnstack.pqn.drivers.dummies.DummyInstrument",
+            "import": "pqn_hardware.pqn.drivers.dummies.DummyInstrument",
             "desc": "Dummy Instrument 1",
             "hw_address": "123456",
         }

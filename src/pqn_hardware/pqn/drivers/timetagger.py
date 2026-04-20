@@ -9,8 +9,8 @@ from TimeTagger import TimeTagger
 from TimeTagger import createTimeTaggerNetwork
 from TimeTagger import freeTimeTagger
 
-from pqnstack.base.instrument import TimeTaggerInfo
-from pqnstack.base.instrument import TimeTaggerInstrument
+from pqn_hardware.base.instrument import TimeTaggerInfo
+from pqn_hardware.base.instrument import TimeTaggerInstrument
 
 logger = logging.getLogger(__name__)
 

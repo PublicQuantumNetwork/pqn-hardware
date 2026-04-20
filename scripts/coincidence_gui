@@ -2,13 +2,13 @@
 # /// script
 # requires-python = ">=3.13"
 # dependencies = [
-#     "pqnstack",
+#     "pqn_hardware",
 #     "pyqt5",
 #     "pyqtgraph",
 # ]
 #
 # [tool.uv.sources]
-# pqnstack = { path = "../" }
+# pqn_hardware = { path = "../" }
 # ///
 
 import sys
@@ -19,8 +19,8 @@ import pyqtgraph as pg
 from PyQt5 import QtCore
 from PyQt5 import QtWidgets
 
-from pqnstack.base.instrument import Instrument
-from pqnstack.network.client import Client
+from pqn_hardware.base.instrument import Instrument
+from pqn_hardware.network.client import Client
 
 
 class Worker(QtCore.QObject):

@@ -3,16 +3,16 @@ from time import sleep
 from typing import TYPE_CHECKING
 from typing import cast
 
-from pqnstack.constants import DEFAULT_SETTINGS
-from pqnstack.constants import HV_BASIS
-from pqnstack.constants import MeasurementBasis
-from pqnstack.network.client import Client
-from pqnstack.network.client import ProxyInstrument
-from pqnstack.pqn.protocols.measurement import MeasurementConfig
-from pqnstack.pqn.protocols.visibility import calculate_visibility
+from pqn_hardware.constants import DEFAULT_SETTINGS
+from pqn_hardware.constants import HV_BASIS
+from pqn_hardware.constants import MeasurementBasis
+from pqn_hardware.network.client import Client
+from pqn_hardware.network.client import ProxyInstrument
+from pqn_hardware.pqn.protocols.measurement import MeasurementConfig
+from pqn_hardware.pqn.protocols.visibility import calculate_visibility
 
 if TYPE_CHECKING:
-    from pqnstack.base.instrument import RotatorInstrument
+    from pqn_hardware.base.instrument import RotatorInstrument
 
 
 @dataclass
@@ -92,7 +92,7 @@ def qkd_run(
 
 
 if __name__ == "__main__":
-    from pqnstack.network.devices.client import client
+    from pqn_hardware.network.devices.client import client
 
     client = client(host="172.30.63.109", timeout=30000)
     qd_device = client.get_device("qkd_device", "devices.qd")

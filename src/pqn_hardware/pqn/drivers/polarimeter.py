@@ -7,7 +7,7 @@ from dataclasses import field
 
 from pyfirmata2 import Arduino
 
-from pqnstack.base.instrument import PolarimeterInstrument
+from pqn_hardware.base.instrument import PolarimeterInstrument
 
 logger = logging.getLogger(__name__)
 

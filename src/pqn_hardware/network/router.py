@@ -4,9 +4,9 @@ import pickle
 
 import zmq
 
-from pqnstack.network.packet import NetworkElementClass
-from pqnstack.network.packet import Packet
-from pqnstack.network.packet import PacketIntent
+from pqn_hardware.network.packet import NetworkElementClass
+from pqn_hardware.network.packet import Packet
+from pqn_hardware.network.packet import PacketIntent
 
 logger = logging.getLogger(__name__)
 

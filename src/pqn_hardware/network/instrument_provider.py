@@ -6,13 +6,13 @@ from typing import Any
 
 import zmq
 
-from pqnstack.base.errors import CouldNotConnectToNetworkElementError
-from pqnstack.base.errors import InvalidInstrumentsConfigurationError
-from pqnstack.base.instrument import Instrument
-from pqnstack.network.packet import NetworkElementClass
-from pqnstack.network.packet import Packet
-from pqnstack.network.packet import PacketIntent
-from pqnstack.network.packet import create_registration_packet
+from pqn_hardware.base.errors import CouldNotConnectToNetworkElementError
+from pqn_hardware.base.errors import InvalidInstrumentsConfigurationError
+from pqn_hardware.base.instrument import Instrument
+from pqn_hardware.network.packet import NetworkElementClass
+from pqn_hardware.network.packet import Packet
+from pqn_hardware.network.packet import PacketIntent
+from pqn_hardware.network.packet import create_registration_packet
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +50,7 @@ class InstrumentProvider:
          ```
          instruments = {
             "rotator_1": {
-                "import": "pqnstack.pqn.drivers.rotator.Rotator",
+                "import": "pqn_hardware.pqn.drivers.rotator.Rotator",
                 "desc": "Rotator in optical table 1",
                 "hw_address": "83860213",
                 **extra_kwargs

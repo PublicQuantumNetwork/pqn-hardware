@@ -15,7 +15,7 @@ from typing import Any
 from typing import Protocol
 from typing import runtime_checkable
 
-from pqnstack.base.errors import LogDecoratorOutsideOfClassError
+from pqn_hardware.base.errors import LogDecoratorOutsideOfClassError
 
 logger = logging.getLogger(__name__)
 

@@ -1,6 +1,6 @@
 import logging
 
-from pqnstack.network.client import Client
+from pqn_hardware.network.client import Client
 
 logging.basicConfig(level=logging.INFO)
 

@@ -1,6 +1,6 @@
 import logging
 
-from pqnstack.network.router import Router
+from pqn_hardware.network.router import Router
 
 logging.basicConfig(level=logging.INFO)
 

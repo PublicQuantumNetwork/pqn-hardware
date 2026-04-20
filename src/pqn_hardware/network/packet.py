@@ -9,7 +9,7 @@ from enum import Enum
 from enum import auto
 from typing import Any
 
-from pqnstack.base.errors import PacketError
+from pqn_hardware.base.errors import PacketError
 
 
 class NetworkElementClass(Enum):

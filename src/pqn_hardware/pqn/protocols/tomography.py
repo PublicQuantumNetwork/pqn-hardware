@@ -2,11 +2,11 @@ import datetime
 import time
 from dataclasses import dataclass
 
-from pqnstack.base.driver.rotator import RotatorInstrument
-from pqnstack.base.instruments import TimeTaggerInstrument
-from pqnstack.constants import DEFAULT_SETTINGS
-from pqnstack.constants import MeasurementBasis
-from pqnstack.pqn.protocols.measurement import MeasurementConfig
+from pqn_hardware.base.driver.rotator import RotatorInstrument
+from pqn_hardware.base.instruments import TimeTaggerInstrument
+from pqn_hardware.constants import DEFAULT_SETTINGS
+from pqn_hardware.constants import MeasurementBasis
+from pqn_hardware.pqn.protocols.measurement import MeasurementConfig
 
 _TOMOGRAPHY_STATES: list[str] = ["H", "V", "D", "A", "R", "L"]
 
@@ -68,7 +68,7 @@ def measure_tomography_raw(
 """
 Example:
 if __name__ == "__main__":
-    from pqnstack.network.client import Client
+    from pqn_hardware.network.client import Client
 
     client = Client(host="172.30.63.109", timeout=30000)
 

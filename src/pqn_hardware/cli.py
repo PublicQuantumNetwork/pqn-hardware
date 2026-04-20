@@ -7,15 +7,15 @@ from typing import Annotated
 import tomli_w
 import typer
 
-from pqnstack.app.core.config import get_settings
-from pqnstack.app.cron_manager import describe_schedule
-from pqnstack.app.cron_manager import get_daily_report_job
-from pqnstack.app.cron_manager import remove_daily_report_job
-from pqnstack.app.cron_manager import set_daily_report_schedule
-from pqnstack.app.daily_report import run_daily_report
-from pqnstack.base.errors import InvalidNetworkConfigurationError
-from pqnstack.network.instrument_provider import InstrumentProvider
-from pqnstack.network.router import Router
+from pqn_hardware.app.core.config import get_settings
+from pqn_hardware.app.cron_manager import describe_schedule
+from pqn_hardware.app.cron_manager import get_daily_report_job
+from pqn_hardware.app.cron_manager import remove_daily_report_job
+from pqn_hardware.app.cron_manager import set_daily_report_schedule
+from pqn_hardware.app.daily_report import run_daily_report
+from pqn_hardware.base.errors import InvalidNetworkConfigurationError
+from pqn_hardware.network.instrument_provider import InstrumentProvider
+from pqn_hardware.network.router import Router
 
 # TODO: check if this way of handling logging from a command line script is ok.
 logging.basicConfig(level=logging.INFO)
@@ -98,7 +98,7 @@ def start_provider(  # noqa: PLR0913
     instruments: Annotated[
         str | None,
         typer.Option(
-            help='JSON formatted string with necessary arguments to instantiate instruments. Example: \'{"dummy1": {"import": "pqnstack.pqn.drivers.dummies.DummyInstrument", "desc": "Dummy Instrument 1", "hw_address": "123456"}}\''
+            help='JSON formatted string with necessary arguments to instantiate instruments. Example: \'{"dummy1": {"import": "pqn_hardware.pqn.drivers.dummies.DummyInstrument", "desc": "Dummy Instrument 1", "hw_address": "123456"}}\''
         ),
     ] = None,
     config: Annotated[

@@ -8,16 +8,16 @@ from http.server import HTTPServer
 from typing import TYPE_CHECKING
 from typing import Any
 
-from pqnstack.constants import DA_BASIS
-from pqnstack.constants import HV_BASIS
-from pqnstack.constants import MeasurementBasis
-from pqnstack.network.client import Client
-from pqnstack.pqn.drivers.polarimeter import ArduinoPolarimeter
-from pqnstack.pqn.drivers.polarimeter import Polarimeter
-from pqnstack.pqn.protocols.measurement import MeasurementConfig
-from pqnstack.pqn.protocols.qkd import Devices as QkdDevices
-from pqnstack.pqn.protocols.qkd import qkd_run
-from pqnstack.pqn.protocols.qrng import pq_random
+from pqn_hardware.constants import DA_BASIS
+from pqn_hardware.constants import HV_BASIS
+from pqn_hardware.constants import MeasurementBasis
+from pqn_hardware.network.client import Client
+from pqn_hardware.pqn.drivers.polarimeter import ArduinoPolarimeter
+from pqn_hardware.pqn.drivers.polarimeter import Polarimeter
+from pqn_hardware.pqn.protocols.measurement import MeasurementConfig
+from pqn_hardware.pqn.protocols.qkd import Devices as QkdDevices
+from pqn_hardware.pqn.protocols.qkd import qkd_run
+from pqn_hardware.pqn.protocols.qrng import pq_random
 
 if TYPE_CHECKING:
     from collections.abc import Callable

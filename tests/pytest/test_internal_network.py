@@ -8,11 +8,11 @@ from typing import Any
 
 import pytest
 
-from pqnstack.network.client import Client
-from pqnstack.network.client import ProxyInstrument
-from pqnstack.network.packet import Packet
-from pqnstack.network.packet import PacketIntent
-from pqnstack.pqn.drivers.dummies import DummyInstrument
+from pqn_hardware.network.client import Client
+from pqn_hardware.network.client import ProxyInstrument
+from pqn_hardware.network.packet import Packet
+from pqn_hardware.network.packet import PacketIntent
+from pqn_hardware.pqn.drivers.dummies import DummyInstrument
 
 logger = logging.getLogger(__name__)
 
@@ -86,20 +86,20 @@ def messaging_services() -> Generator[None, Any, None]:
 
 
 def test_client_ping() -> None:
-    client = Client(host="localhost", port=5556, router_name="pqnstack-router", timeout=1000)
-    response = client.ping("pqnstack-provider")
+    client = Client(host="localhost", port=5556, router_name="pqn_hardware-router", timeout=1000)
+    response = client.ping("pqn_hardware-provider")
 
     assert isinstance(response, Packet)
     assert response.intent == PacketIntent.PING
-    assert response.source == "pqnstack-provider"
+    assert response.source == "pqn_hardware-provider"
     assert response.destination == client.name
     assert response.request == "PONG"
 
 
 def test_getting_all_instruments() -> None:
-    client = Client(host="localhost", port=5556, router_name="pqnstack-router", timeout=1000)
+    client = Client(host="localhost", port=5556, router_name="pqn_hardware-router", timeout=1000)
 
-    response = client.get_available_devices("pqnstack-provider")
+    response = client.get_available_devices("pqn_hardware-provider")
 
     instruments_names = ["dummy1", "dummy2"]
 
@@ -110,9 +110,9 @@ def test_getting_all_instruments() -> None:
 
 
 def test_proxy_instrument() -> None:
-    client = Client(host="localhost", port=5556, router_name="pqnstack-router", timeout=1000)
+    client = Client(host="localhost", port=5556, router_name="pqn_hardware-router", timeout=1000)
 
-    proxy_instrument = client.get_device("pqnstack-provider", "dummy1")
+    proxy_instrument = client.get_device("pqn_hardware-provider", "dummy1")
     assert isinstance(proxy_instrument, ProxyInstrument)
 
     base_int = 2

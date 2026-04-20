@@ -11,13 +11,13 @@ from typing import Self
 
 import zmq
 
-from pqnstack.base.errors import PacketError
-from pqnstack.base.instrument import Instrument
-from pqnstack.base.instrument import InstrumentInfo
-from pqnstack.network.packet import NetworkElementClass
-from pqnstack.network.packet import Packet
-from pqnstack.network.packet import PacketIntent
-from pqnstack.network.packet import create_registration_packet
+from pqn_hardware.base.errors import PacketError
+from pqn_hardware.base.instrument import Instrument
+from pqn_hardware.base.instrument import InstrumentInfo
+from pqn_hardware.network.packet import NetworkElementClass
+from pqn_hardware.network.packet import Packet
+from pqn_hardware.network.packet import PacketIntent
+from pqn_hardware.network.packet import create_registration_packet
 
 logger = logging.getLogger(__name__)
 

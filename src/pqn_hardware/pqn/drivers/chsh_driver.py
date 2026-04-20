@@ -3,16 +3,16 @@ from dataclasses import dataclass
 from dataclasses import field
 from typing import cast
 
-from pqnstack.base.instrument import Instrument
-from pqnstack.base.instrument import InstrumentInfo
-from pqnstack.base.instrument import RotatorInstrument
-from pqnstack.base.instrument import TimeTaggerInstrument
-from pqnstack.base.instrument import log_operation
-from pqnstack.network.client import Client
-from pqnstack.pqn.protocols.chsh import Devices
-from pqnstack.pqn.protocols.chsh import measure_chsh
-from pqnstack.pqn.protocols.measurement import CHSHValue
-from pqnstack.pqn.protocols.measurement import MeasurementConfig
+from pqn_hardware.base.instrument import Instrument
+from pqn_hardware.base.instrument import InstrumentInfo
+from pqn_hardware.base.instrument import RotatorInstrument
+from pqn_hardware.base.instrument import TimeTaggerInstrument
+from pqn_hardware.base.instrument import log_operation
+from pqn_hardware.network.client import Client
+from pqn_hardware.pqn.protocols.chsh import Devices
+from pqn_hardware.pqn.protocols.chsh import measure_chsh
+from pqn_hardware.pqn.protocols.measurement import CHSHValue
+from pqn_hardware.pqn.protocols.measurement import MeasurementConfig
 
 logger = logging.getLogger(__name__)
 

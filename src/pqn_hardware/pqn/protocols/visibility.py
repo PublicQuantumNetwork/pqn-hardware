@@ -2,9 +2,9 @@ import math
 import time
 from typing import Any
 
-from pqnstack.base.instrument import RotatorInstrument
-from pqnstack.constants import MeasurementBasis
-from pqnstack.pqn.protocols.measurement import MeasurementConfig
+from pqn_hardware.base.instrument import RotatorInstrument
+from pqn_hardware.constants import MeasurementBasis
+from pqn_hardware.pqn.protocols.measurement import MeasurementConfig
 
 
 class Devices:
@@ -78,7 +78,7 @@ def calculate_visibility(
 Example:
 
 if __name__ == "__main__":
-    from pqnstack.network.client import Client
+    from pqn_hardware.network.client import Client
 
     c = Client(host="172.30.63.109", timeout=300000)
     idler_hwp = c.get_device("loomis_server", "signal_hwp")
