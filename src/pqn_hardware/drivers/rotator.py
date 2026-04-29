@@ -7,6 +7,7 @@ import logging
 import time
 from dataclasses import dataclass
 from dataclasses import field
+from typing import ClassVar
 
 import serial
 from thorlabs_apt_device import KDC101
@@ -59,14 +60,6 @@ class APTRotator(RotatorInstrument):
             degrees=self.degrees,
             offset_degrees=self.offset_degrees,
         )
-
-    def _read_until_reply(self, timeout: float = 5.0) -> str:
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            raw = self._conn.readline()
-            if raw:
-                return raw.decode("ascii", errors="replace").strip()
-        return ""
 
     def _wait_for_stop(self) -> None:
         if self._device is None:
@@ -143,6 +136,12 @@ class SerialRotator(RotatorInstrument):
 class EllxRotator(RotatorInstrument):
     """Driver for Thorlabs ELLx-series rotation mounts via the ASCII ELLx serial protocol."""
 
+    _GS_MIN_LEN: ClassVar[int] = 5
+    _STATUS_BUSY: ClassVar[int] = 0x09
+    _PO_MIN_LEN: ClassVar[int] = 11
+    _INT32_MAX: ClassVar[int] = 0x7FFFFFFF
+    _UINT32_WRAP: ClassVar[int] = 0x100000000
+
     bus_address: str = "0"
     _degrees: float = field(default=0.0, init=False)
     _conn: serial.Serial = field(init=False, repr=False)
@@ -194,7 +193,7 @@ class EllxRotator(RotatorInstrument):
         self._conn.flush()
 
     def _read_line(self) -> str:
-        raw = self._conn.readline()
+        raw: bytes = self._conn.readline()
         if not raw:
             return ""
         return raw.decode("ascii", errors="replace").strip()
@@ -222,7 +221,7 @@ class EllxRotator(RotatorInstrument):
     def _read_until_reply(self, timeout: float = 5.0) -> str:
         deadline = time.time() + timeout
         while time.time() < deadline:
-            raw = self._conn.readline()
+            raw: bytes = self._conn.readline()
             if raw:
                 return raw.decode("ascii", errors="replace").strip()
         return ""
@@ -231,13 +230,13 @@ class EllxRotator(RotatorInstrument):
         try:
             while True:
                 reply = self._query(f"{self.bus_address}gs", settle_s=0.02)
-                if not reply or len(reply) < _ELLX_GS_MIN_LEN or reply[1:3].upper() != "GS":
+                if not reply or len(reply) < self._GS_MIN_LEN or reply[1:3].upper() != "GS":
                     break
                 try:
                     code = int(reply[3:5], 16)
                 except ValueError:
                     break
-                if code != _ELLX_STATUS_BUSY:
+                if code != self._STATUS_BUSY:
                     break
                 time.sleep(0.05)
         except KeyboardInterrupt:
@@ -246,11 +245,11 @@ class EllxRotator(RotatorInstrument):
     @property
     def degrees(self) -> float:
         reply = self._query(f"{self.bus_address}gp", settle_s=0.05)
-        if reply and len(reply) >= _ELLX_PO_MIN_LEN and reply[1:3].upper() == "PO":
+        if reply and len(reply) >= self._PO_MIN_LEN and reply[1:3].upper() == "PO":
             try:
                 raw = int(reply[3:11], 16)
-                if raw > _INT32_MAX:
-                    raw -= _UINT32_WRAP
+                if raw > self._INT32_MAX:
+                    raw -= self._UINT32_WRAP
                 self._degrees = self._encoder_to_degrees(raw)
             except ValueError:
                 pass
