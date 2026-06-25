@@ -61,7 +61,7 @@ class ID900TimeTagger(TimeTaggerInstrument):
         stop_ch: int,
         integration_time_s: float = 1.0,
         coinc_window_ps: int = 1000,
-        inwidth_ps: int = 1,  # noqa: ARG002 - unused; the Rabbit has no time-resolved histogram
+        binwidth_ps: int = 1,  # noqa: ARG002 - unused; the Rabbit has no time-resolved histogram
         n_bins: int = int(1e5),  # noqa: ARG002 - unused; kept for interface compatibility
     ) -> int:
         count_time_ms = int(integration_time_s * 1e3)
