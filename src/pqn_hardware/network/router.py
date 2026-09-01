@@ -34,6 +34,10 @@ class Router:
         logger.info("Starting router %s at %s", self.name, self.address)
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.ROUTER)
+        # Let a reconnecting peer reclaim its routing id. Without this, libzmq quarantines a
+        # peer whose identity is already taken (e.g. by a half-open socket left behind when a
+        # provider drops off the network) and silently discards everything it sends.
+        self.socket.setsockopt(zmq.ROUTER_HANDOVER, 1)
         self.socket.bind(self.address)
         logger.info("Router %s is now listening on %s", self.name, self.address)
         self.running = True
