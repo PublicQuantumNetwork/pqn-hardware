@@ -4,6 +4,7 @@ The CLI smoke test in test_cli_smoke.py covers starting the same elements as sub
 """
 
 import datetime
+import json
 import logging
 import socket
 import threading
@@ -25,6 +26,7 @@ from pqn_hardware.network.client import Client
 from pqn_hardware.network.client import ProxyInstrument
 from pqn_hardware.network.client import _dump_argument
 from pqn_hardware.network.instrument_provider import InstrumentProvider
+from pqn_hardware.network.packet import PROTOCOL_VERSION
 from pqn_hardware.network.packet import CallOperationPayload
 from pqn_hardware.network.packet import DeviceSummary
 from pqn_hardware.network.packet import ErrorCode
@@ -788,6 +790,282 @@ def test_wrong_frame_count_gets_malformed_packet_and_the_router_keeps_running(ne
         # The Router keeps serving after the bad input.
         ping = Packet(
             intent=PacketIntent.PING, request=Request.PING, source="bad-frames-client", destination=PROVIDER_NAME
+        )
+        socket.send(encode(ping))
+        pong = decode(socket.recv())
+        assert pong.request == Request.PONG
+        assert pong.reply_to == ping.id
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        socket.close()
+        context.term()
+
+
+def test_garbage_bytes_get_malformed_packet_and_the_router_keeps_running(network_port: int) -> None:
+    # Bytes a pre-v2 pickle peer would send: not JSON at all, so there is no id to echo. The
+    # reply still carries the request-id frame the message arrived with, so a REQ_CORRELATE
+    # Client's socket accepts the error instead of timing out.
+    context = zmq.Context()
+    socket = context.socket(zmq.REQ)
+    socket.setsockopt(zmq.REQ_RELAXED, 1)
+    socket.setsockopt(zmq.REQ_CORRELATE, 1)
+    socket.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+    socket.setsockopt_string(zmq.IDENTITY, "garbage-client")
+    socket.connect(f"tcp://{HOST}:{network_port}")
+
+    registration = create_registration_packet(
+        source="garbage-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
+    )
+    socket.send(encode(registration))
+    assert decode(socket.recv()).intent == PacketIntent.REGISTRATION_ACK
+
+    try:
+        socket.send(b"\x80\x04\x95pickle-bytes")
+        reply = decode(socket.recv())
+
+        assert reply.intent == PacketIntent.ERROR
+        assert reply.request == Request.ERROR
+        # The garbage carries no readable id, so the error reply carries a null reply_to.
+        assert reply.reply_to is None
+        # The Router sends the error reply: it names itself as the source.
+        assert reply.source == ROUTER_NAME
+        assert reply.destination == "garbage-client"
+        payload = ErrorPayload.model_validate(reply.payload)
+        assert payload.code == ErrorCode.MALFORMED_PACKET
+        assert payload.origin == ROUTER_NAME
+
+        # The Router keeps serving after the garbage bytes.
+        ping = Packet(
+            intent=PacketIntent.PING, request=Request.PING, source="garbage-client", destination=PROVIDER_NAME
+        )
+        socket.send(encode(ping))
+        pong = decode(socket.recv())
+        assert pong.request == Request.PONG
+        assert pong.reply_to == ping.id
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        socket.close()
+        context.term()
+
+
+def test_unsupported_version_gets_unsupported_version_error(network_port: int) -> None:
+    # A version this Router does not speak gets a fast UNSUPPORTED_VERSION reply whose details
+    # carry the expected and received versions, and the Router keeps serving afterwards.
+    context = zmq.Context()
+    socket = context.socket(zmq.REQ)
+    socket.setsockopt(zmq.REQ_RELAXED, 1)
+    socket.setsockopt(zmq.REQ_CORRELATE, 1)
+    socket.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+    socket.setsockopt_string(zmq.IDENTITY, "old-version-client")
+    socket.connect(f"tcp://{HOST}:{network_port}")
+
+    registration = create_registration_packet(
+        source="old-version-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
+    )
+    socket.send(encode(registration))
+    assert decode(socket.recv()).intent == PacketIntent.REGISTRATION_ACK
+
+    try:
+        # A hand-written wire envelope speaking an older protocol version.
+        request = Packet(
+            intent=PacketIntent.PING, request=Request.PING, source="old-version-client", destination=PROVIDER_NAME
+        )
+        wire = json.loads(encode(request))
+        wire["version"] = 1
+        socket.send(json.dumps(wire).encode("utf-8"))
+        reply = decode(socket.recv())
+
+        assert reply.intent == PacketIntent.ERROR
+        assert reply.reply_to == request.id
+        payload = ErrorPayload.model_validate(reply.payload)
+        assert payload.code == ErrorCode.UNSUPPORTED_VERSION
+        assert payload.origin == ROUTER_NAME
+        assert payload.details == {"expected": PROTOCOL_VERSION, "received": 1}
+
+        # The Router keeps serving after the unsupported version.
+        ping = Packet(
+            intent=PacketIntent.PING, request=Request.PING, source="old-version-client", destination=PROVIDER_NAME
+        )
+        socket.send(encode(ping))
+        pong = decode(socket.recv())
+        assert pong.request == Request.PONG
+        assert pong.reply_to == ping.id
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        socket.close()
+        context.term()
+
+
+def test_missing_version_gets_malformed_packet(network_port: int) -> None:
+    # A missing version fails envelope validation: the Router replies MALFORMED_PACKET,
+    # echoing the request's id as reply_to, and keeps serving afterwards.
+    context = zmq.Context()
+    socket = context.socket(zmq.REQ)
+    socket.setsockopt(zmq.REQ_RELAXED, 1)
+    socket.setsockopt(zmq.REQ_CORRELATE, 1)
+    socket.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+    socket.setsockopt_string(zmq.IDENTITY, "no-version-client")
+    socket.connect(f"tcp://{HOST}:{network_port}")
+
+    registration = create_registration_packet(
+        source="no-version-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
+    )
+    socket.send(encode(registration))
+    assert decode(socket.recv()).intent == PacketIntent.REGISTRATION_ACK
+
+    try:
+        # A hand-written wire envelope with no version at all.
+        request = Packet(
+            intent=PacketIntent.PING, request=Request.PING, source="no-version-client", destination=PROVIDER_NAME
+        )
+        wire = json.loads(encode(request))
+        del wire["version"]
+        socket.send(json.dumps(wire).encode("utf-8"))
+        reply = decode(socket.recv())
+
+        assert reply.intent == PacketIntent.ERROR
+        # The id parses as a JSON object's string id, so it is echoed as reply_to.
+        assert reply.reply_to == request.id
+        payload = ErrorPayload.model_validate(reply.payload)
+        assert payload.code == ErrorCode.MALFORMED_PACKET
+        assert payload.origin == ROUTER_NAME
+
+        # The Router keeps serving after the missing version.
+        ping = Packet(
+            intent=PacketIntent.PING, request=Request.PING, source="no-version-client", destination=PROVIDER_NAME
+        )
+        socket.send(encode(ping))
+        pong = decode(socket.recv())
+        assert pong.request == Request.PONG
+        assert pong.reply_to == ping.id
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        socket.close()
+        context.term()
+
+
+def test_invalid_registration_payload_gets_malformed_packet(network_port: int) -> None:
+    # An invalid REGISTER Payload gets a fast MALFORMED_PACKET reply instead of crashing the
+    # Router, and the Router keeps serving afterwards.
+    context = zmq.Context()
+    socket = context.socket(zmq.REQ)
+    socket.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+    socket.setsockopt_string(zmq.IDENTITY, "bad-register-client")
+    socket.connect(f"tcp://{HOST}:{network_port}")
+
+    registration = create_registration_packet(
+        source="bad-register-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
+    )
+    socket.send(encode(registration))
+    assert decode(socket.recv()).intent == PacketIntent.REGISTRATION_ACK
+
+    try:
+        # A REGISTER Packet whose Payload fails validation: no valid registration kind.
+        request = Packet(
+            intent=PacketIntent.REGISTRATION,
+            request=Request.REGISTER,
+            source="bad-register-client",
+            destination=ROUTER_NAME,
+            payload={"kind": "NOT_A_KIND"},
+        )
+        socket.send(encode(request))
+        reply = decode(socket.recv())
+
+        assert reply.intent == PacketIntent.ERROR
+        assert reply.reply_to == request.id
+        payload = ErrorPayload.model_validate(reply.payload)
+        assert payload.code == ErrorCode.MALFORMED_PACKET
+        assert payload.origin == ROUTER_NAME
+
+        # The Router keeps serving after the invalid registration.
+        ping = Packet(
+            intent=PacketIntent.PING, request=Request.PING, source="bad-register-client", destination=PROVIDER_NAME
+        )
+        socket.send(encode(ping))
+        pong = decode(socket.recv())
+        assert pong.request == Request.PONG
+        assert pong.reply_to == ping.id
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        socket.close()
+        context.term()
+
+
+def test_unknown_destination_error_lists_registered_providers(network_port: int) -> None:
+    # The UNKNOWN_DESTINATION reply lists the Providers registered with the Router,
+    # so the message says what went wrong instead of "Routing not implemented yet."
+    context = zmq.Context()
+    socket = context.socket(zmq.REQ)
+    socket.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+    socket.setsockopt_string(zmq.IDENTITY, "lost-client")
+    socket.connect(f"tcp://{HOST}:{network_port}")
+
+    registration = create_registration_packet(
+        source="lost-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
+    )
+    socket.send(encode(registration))
+    assert decode(socket.recv()).intent == PacketIntent.REGISTRATION_ACK
+
+    try:
+        request = Packet(
+            intent=PacketIntent.DATA, request=Request.GET_DEVICES, source="lost-client", destination="no-such-provider"
+        )
+        socket.send(encode(request))
+        reply = decode(socket.recv())
+
+        payload = _assert_error_reply(reply, request, ErrorCode.UNKNOWN_DESTINATION, ROUTER_NAME)
+        assert f"Destination 'no-such-provider' is not registered with {ROUTER_NAME}" in payload.message
+        assert PROVIDER_NAME in payload.message
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        socket.close()
+        context.term()
+
+
+def test_error_packet_addressed_to_the_router_is_never_answered(
+    network_port: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    # An ERROR Packet is itself a reply and is never answered, so errors cannot bounce forever:
+    # the Router logs a warning, the sender gets no reply, and the Router keeps serving.
+    context = zmq.Context()
+    socket = context.socket(zmq.REQ)
+    socket.setsockopt(zmq.REQ_RELAXED, 1)
+    socket.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+    socket.setsockopt_string(zmq.IDENTITY, "error-sender-client")
+    socket.connect(f"tcp://{HOST}:{network_port}")
+
+    registration = create_registration_packet(
+        source="error-sender-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
+    )
+    socket.send(encode(registration))
+    assert decode(socket.recv()).intent == PacketIntent.REGISTRATION_ACK
+
+    try:
+        error_packet = Packet(
+            intent=PacketIntent.ERROR,
+            request=Request.ERROR,
+            source="error-sender-client",
+            destination=ROUTER_NAME,
+            payload=ErrorPayload(
+                code=ErrorCode.INSTRUMENT_ERROR, message="an error the Router never asked for", origin="error-sender"
+            ).model_dump(),
+        )
+        with caplog.at_level(logging.WARNING, logger="pqn_hardware.network.router"):
+            socket.send(encode(error_packet))
+            with pytest.raises(zmq.error.Again):
+                socket.recv()
+
+        assert any("ERROR Packet" in record.message for record in caplog.records)
+
+        # The Router keeps serving after dropping the ERROR Packet.
+        ping = Packet(
+            intent=PacketIntent.PING, request=Request.PING, source="error-sender-client", destination=PROVIDER_NAME
         )
         socket.send(encode(ping))
         pong = decode(socket.recv())

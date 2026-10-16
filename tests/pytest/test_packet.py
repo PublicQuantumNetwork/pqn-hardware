@@ -5,8 +5,10 @@ import re
 from enum import StrEnum
 from typing import Any
 
+import pytest
 from hypothesis import given
 from hypothesis import strategies as st
+from pydantic import ValidationError
 
 from pqn_hardware.network.packet import PROTOCOL_VERSION
 from pqn_hardware.network.packet import CallOperationPayload
@@ -126,6 +128,16 @@ packets = st.builds(
 @given(packet=packets)
 def test_packet_round_trip(packet: Packet) -> None:
     assert decode(encode(packet)) == packet
+
+
+def test_missing_version_fails_decode() -> None:
+    """A missing version on the wire fails validation; the default only applies to construction."""
+    packet = Packet(intent=PacketIntent.DATA, request=Request.GET_DEVICES, source="source1", destination="dest1")
+    wire = json.loads(encode(packet))
+    del wire["version"]
+
+    with pytest.raises(ValidationError, match="version"):
+        decode(json.dumps(wire).encode("utf-8"))
 
 
 def test_enums_serialize_by_name() -> None:

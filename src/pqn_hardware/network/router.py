@@ -1,7 +1,11 @@
+import json
 import logging
+from typing import Any
 
 import zmq
+from pydantic import ValidationError
 
+from pqn_hardware.network.packet import PROTOCOL_VERSION
 from pqn_hardware.network.packet import ErrorCode
 from pqn_hardware.network.packet import ErrorPayload
 from pqn_hardware.network.packet import NetworkElementClass
@@ -13,6 +17,18 @@ from pqn_hardware.network.packet import decode
 from pqn_hardware.network.packet import encode
 
 logger = logging.getLogger(__name__)
+
+
+def _readable_reply_to(data: bytes) -> str | None:
+    """Return the id of undecodable wire bytes when they parse as a JSON object with a string id."""
+    try:
+        parsed = json.loads(data)
+    except ValueError:
+        return None
+    packet_id: Any = parsed.get("id") if isinstance(parsed, dict) else None
+    if isinstance(packet_id, str):
+        return packet_id
+    return None
 
 
 # FIXME: handle not finding destination and source better
@@ -59,11 +75,21 @@ class Router:
                     logger.error("Error listening to packets. Either the packet is None or the identity is None.")
                     continue
 
-                match packet.intent:
-                    case PacketIntent.REGISTRATION:
-                        self.handle_registration(identity_binary, packet)
-                    case _:
-                        self.handle_pass_packet(identity_binary, packet)
+                try:
+                    match packet.intent:
+                        case PacketIntent.REGISTRATION:
+                            self.handle_registration(identity_binary, packet)
+                        case _:
+                            self.handle_pass_packet(identity_binary, packet)
+                except ValidationError as e:
+                    # A Payload that fails validation (e.g. an invalid REGISTER Payload) gets a
+                    # fast MALFORMED_PACKET reply instead of crashing the Router.
+                    self.handle_packet_error(
+                        identity_binary,
+                        ErrorCode.MALFORMED_PACKET,
+                        f"Payload does not match request '{packet.request}': {e}",
+                        reply_to=packet.id,
+                    )
 
         finally:
             self.socket.close()
@@ -98,7 +124,12 @@ class Router:
     def handle_pass_packet(self, identity_binary: bytes, packet: Packet) -> None:
         """Handle all the logic to get a packet from one place to another."""
         if packet.destination == self.name:
-            logger.info("Packet destination is self, dropping")
+            if packet.intent == PacketIntent.ERROR:
+                # An ERROR Packet is itself a reply and is never answered, so errors cannot
+                # bounce forever.
+                logger.warning("Received an ERROR Packet, which the Router never asked for: %s", packet)
+            else:
+                logger.info("Packet destination is self, dropping")
 
         elif packet.destination in self.providers or packet.destination in self.clients:
             logger.info("Packet destination is a provider called %s, routing message there", packet.destination)
@@ -116,12 +147,12 @@ class Router:
             logger.info("Sent packet to %s", packet.destination)
 
         else:
-            logger.info("Packet destination is not a provider will ask other routers in system")
-            # FIXME: This is temporary and should be replaced with the routing algorithm.
+            logger.info("Packet destination %s is not registered with this Router", packet.destination)
             self.handle_packet_error(
                 identity_binary,
                 ErrorCode.UNKNOWN_DESTINATION,
-                "Routing not implemented yet.",
+                f"Destination '{packet.destination}' is not registered with {self.name}. "
+                f"Registered: {', '.join(self.providers)}",
                 reply_to=packet.id,
             )
 
@@ -152,14 +183,38 @@ class Router:
             )
             return None, None
 
-        packet = decode(data)
+        try:
+            packet = decode(data)
+        except ValidationError as e:
+            # The Router never crashes on input: bytes it cannot decode get a fast
+            # MALFORMED_PACKET reply. reply_to is the id when the data parses as a JSON
+            # object with a string id, and the reply carries the request-id frame the
+            # message arrived with, even when reply_to is null.
+            self.handle_packet_error(
+                identity_binary,
+                ErrorCode.MALFORMED_PACKET,
+                f"Packet is not valid JSON for this protocol (a pre-v2 pickle peer sends non-JSON bytes): {e}",
+                reply_to=_readable_reply_to(data),
+                request_id=request_id,
+            )
+            return None, None
         if request_id is not None:
             # Only the latest request-id frame and request id of each Client is remembered.
             self.request_ids[identity_binary] = (request_id, packet.id)
+        if packet.version != PROTOCOL_VERSION:
+            # The Router enforces an exact version match, including at registration.
+            self.handle_packet_error(
+                identity_binary,
+                ErrorCode.UNSUPPORTED_VERSION,
+                f"Packet version {packet.version} is not supported, this Router speaks version {PROTOCOL_VERSION}.",
+                reply_to=packet.id,
+                details={"expected": PROTOCOL_VERSION, "received": packet.version},
+            )
+            return None, None
         logger.info("Received packet from %s: %s", identity_binary, packet)
         return identity_binary, packet
 
-    def _send(self, destination: bytes, packet: Packet) -> None:
+    def _send(self, destination: bytes, packet: Packet, request_id: bytes | None = None) -> None:
         # This should never happen, but mypy complains if the check is not done
         if self.socket is None:
             msg = "Socket is None, cannot send message."
@@ -170,14 +225,26 @@ class Router:
         frames = [destination, b"", encode(packet)]
         # A reply to a Client's latest request carries its request-id frame back, so the Client's
         # REQ socket accepts it; any other Packet goes without it, so the socket drops it.
-        remembered = self.request_ids.get(destination)
-        if remembered is not None and packet.reply_to == remembered[1]:
-            frames.insert(1, remembered[0])
+        # An error reply to a message just received carries that message's request-id frame even
+        # when its reply_to is null.
+        frame = request_id
+        if frame is None:
+            remembered = self.request_ids.get(destination)
+            if remembered is not None and packet.reply_to == remembered[1]:
+                frame = remembered[0]
+        if frame is not None:
+            frames.insert(1, frame)
         self.socket.send_multipart(frames)
         logger.info("Packet sent to %s", packet.destination)
 
-    def handle_packet_error(
-        self, destination: bytes, code: ErrorCode, message: str, reply_to: str | None = None
+    def handle_packet_error(  # noqa: PLR0913
+        self,
+        destination: bytes,
+        code: ErrorCode,
+        message: str,
+        reply_to: str | None = None,
+        details: dict[str, Any] | None = None,
+        request_id: bytes | None = None,
     ) -> None:
         logger.error(message)
         error_packet = Packet(
@@ -186,6 +253,6 @@ class Router:
             source=self.name,
             destination=destination.decode("utf-8"),
             reply_to=reply_to,
-            payload=ErrorPayload(code=code, message=message, origin=self.name).model_dump(),
+            payload=ErrorPayload(code=code, message=message, origin=self.name, details=details or {}).model_dump(),
         )
-        self._send(destination, error_packet)
+        self._send(destination, error_packet, request_id=request_id)
