@@ -904,6 +904,52 @@ def test_garbage_bytes_from_a_dealer_with_a_non_utf8_identity_get_malformed_pack
         context.term()
 
 
+def test_a_non_utf8_identity_client_receives_the_routers_own_replies(network_port: int) -> None:
+    # A REQ_CORRELATE Client whose identity frame is not UTF-8 text still receives the
+    # Router's own replies: they carry its request-id frame back, looked up by the identity
+    # bytes, not by the reply Packet's destination text. Without the frame the socket drops
+    # every reply and the Client would time out instead of getting a fast error.
+    context = zmq.Context()
+    socket = context.socket(zmq.REQ)
+    socket.setsockopt(zmq.REQ_RELAXED, 1)
+    socket.setsockopt(zmq.REQ_CORRELATE, 1)
+    socket.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+    socket.setsockopt(zmq.IDENTITY, b"\x00\xff\xfe\xfd")
+    socket.connect(f"tcp://{HOST}:{network_port}")
+
+    try:
+        # A v2 Packet to an unknown destination gets a fast UNKNOWN_DESTINATION reply that
+        # passes the socket's request-id filter.
+        request = Packet(
+            intent=PacketIntent.DATA,
+            request=Request.GET_DEVICES,
+            source="non-utf8-req-client",
+            destination="no-such-destination",
+        )
+        socket.send(encode(request))
+        reply = decode(socket.recv())
+
+        assert reply.intent == PacketIntent.ERROR
+        assert reply.reply_to == request.id
+        payload = ErrorPayload.model_validate(reply.payload)
+        assert payload.code == ErrorCode.UNKNOWN_DESTINATION
+        assert payload.origin == ROUTER_NAME
+
+        # Its REGISTRATION_ACK passes the filter too.
+        registration = create_registration_packet(
+            source="non-utf8-req-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
+        )
+        socket.send(encode(registration))
+        ack = decode(socket.recv())
+        assert ack.intent == PacketIntent.REGISTRATION_ACK
+        assert ack.reply_to == registration.id
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        socket.close()
+        context.term()
+
+
 def test_wrong_version_packets_are_refused_never_handled(network_port: int) -> None:
     # A wrong-version Packet is refused and never handled: no second reply follows the
     # UNSUPPORTED_VERSION error, the Provider never receives the Packet, and the sender is
@@ -1027,9 +1073,11 @@ def test_json_that_is_not_a_usable_envelope_gets_malformed_packet(network_port: 
         context.term()
 
 
-def test_unsupported_version_register_gets_unsupported_version_error(network_port: int) -> None:
-    # The version is enforced on REGISTER too: a version-1 REGISTER never gets a
-    # REGISTRATION_ACK, and a following v2 REGISTER still gets its own acknowledgement.
+@pytest.mark.parametrize("version", [1, 3], ids=["older-version", "newer-version"])
+def test_unsupported_version_register_gets_unsupported_version_error(network_port: int, version: int) -> None:
+    # The version is enforced on REGISTER too, as an exact match: a REGISTER in
+    # any other version, older or newer, never gets a REGISTRATION_ACK, and a following v2
+    # REGISTER still gets its own acknowledgement.
     context = zmq.Context()
     socket = context.socket(zmq.REQ)
     socket.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
@@ -1037,12 +1085,12 @@ def test_unsupported_version_register_gets_unsupported_version_error(network_por
     socket.connect(f"tcp://{HOST}:{network_port}")
 
     try:
-        # A hand-written REGISTER speaking an older protocol version.
+        # A hand-written REGISTER speaking another protocol version.
         request = create_registration_packet(
             source="old-register-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
         )
         wire = json.loads(encode(request))
-        wire["version"] = 1
+        wire["version"] = version
         socket.send(json.dumps(wire).encode("utf-8"))
         reply = decode(socket.recv())
 
@@ -1051,7 +1099,7 @@ def test_unsupported_version_register_gets_unsupported_version_error(network_por
         payload = ErrorPayload.model_validate(reply.payload)
         assert payload.code == ErrorCode.UNSUPPORTED_VERSION
         assert payload.origin == ROUTER_NAME
-        assert payload.details == {"expected": PROTOCOL_VERSION, "received": 1}
+        assert payload.details == {"expected": PROTOCOL_VERSION, "received": version}
 
         # A following v2 REGISTER still gets its acknowledgement.
         v2_request = create_registration_packet(
@@ -1068,9 +1116,11 @@ def test_unsupported_version_register_gets_unsupported_version_error(network_por
         context.term()
 
 
-def test_unsupported_version_gets_unsupported_version_error(network_port: int) -> None:
-    # A version this Router does not speak gets a fast UNSUPPORTED_VERSION reply whose details
-    # carry the expected and received versions, and the Router keeps serving afterwards.
+@pytest.mark.parametrize("version", [1, 3], ids=["older-version", "newer-version"])
+def test_unsupported_version_gets_unsupported_version_error(network_port: int, version: int) -> None:
+    # A version this Router does not speak, older or newer (an exact match), gets
+    # a fast UNSUPPORTED_VERSION reply whose details carry the expected and received versions,
+    # and the Router keeps serving afterwards.
     context = zmq.Context()
     socket = context.socket(zmq.REQ)
     socket.setsockopt(zmq.REQ_RELAXED, 1)
@@ -1086,12 +1136,12 @@ def test_unsupported_version_gets_unsupported_version_error(network_port: int) -
     assert decode(socket.recv()).intent == PacketIntent.REGISTRATION_ACK
 
     try:
-        # A hand-written wire envelope speaking an older protocol version.
+        # A hand-written wire envelope speaking another protocol version.
         request = Packet(
             intent=PacketIntent.PING, request=Request.PING, source="old-version-client", destination=PROVIDER_NAME
         )
         wire = json.loads(encode(request))
-        wire["version"] = 1
+        wire["version"] = version
         socket.send(json.dumps(wire).encode("utf-8"))
         reply = decode(socket.recv())
 
@@ -1100,7 +1150,7 @@ def test_unsupported_version_gets_unsupported_version_error(network_port: int) -
         payload = ErrorPayload.model_validate(reply.payload)
         assert payload.code == ErrorCode.UNSUPPORTED_VERSION
         assert payload.origin == ROUTER_NAME
-        assert payload.details == {"expected": PROTOCOL_VERSION, "received": 1}
+        assert payload.details == {"expected": PROTOCOL_VERSION, "received": version}
 
         # The Router keeps serving after the unsupported version.
         ping = Packet(
