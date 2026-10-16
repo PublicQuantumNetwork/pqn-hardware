@@ -1,11 +1,14 @@
 """Round-trip tests for the wire protocol models: every Payload model through JSON, and the envelope through encode/decode."""
 
+import json
+import re
 from enum import StrEnum
 from typing import Any
 
 from hypothesis import given
 from hypothesis import strategies as st
 
+from pqn_hardware.network.packet import PROTOCOL_VERSION
 from pqn_hardware.network.packet import CallOperationPayload
 from pqn_hardware.network.packet import DevicesPayload
 from pqn_hardware.network.packet import DeviceSummary
@@ -134,3 +137,28 @@ def test_enums_serialize_by_name() -> None:
     assert PacketIntent.DATA.value == "DATA"
     assert Request.CALL_OPERATION.value == "CALL_OPERATION"
     assert ErrorCode.UNKNOWN_DESTINATION.value == "UNKNOWN_DESTINATION"
+
+
+def test_default_packet_envelope() -> None:
+    """A default Packet pins the envelope defaults the wire protocol depends on."""
+    json_wire_version = 2
+    assert json_wire_version == PROTOCOL_VERSION
+
+    packet = Packet(intent=PacketIntent.DATA, request=Request.GET_DEVICES, source="source1", destination="dest1")
+
+    assert packet.version == PROTOCOL_VERSION
+    assert packet.hops == 0
+    assert packet.reply_to is None
+    assert re.fullmatch(r"[0-9a-f]{32}", packet.id) is not None
+
+    # Each Packet gets its own correlation id.
+    other = Packet(intent=PacketIntent.DATA, request=Request.GET_DEVICES, source="source1", destination="dest1")
+    assert other.id != packet.id
+
+    wire = json.loads(encode(packet))
+    assert wire["version"] == json_wire_version
+    assert wire["id"] == packet.id
+    assert wire["reply_to"] is None
+    assert wire["hops"] == 0
+    assert wire["intent"] == "DATA"
+    assert wire["request"] == "GET_DEVICES"

@@ -280,7 +280,9 @@ class InstrumentProvider:
         ins_name = request_payload.instrument
 
         if ins_name not in self.instantiated_instruments:
-            return self._create_error_packet(packet.source, ErrorCode.UNKNOWN_INSTRUMENT, f"Instrument '{ins_name}' not found.")
+            return self._create_error_packet(
+                packet.source, ErrorCode.UNKNOWN_INSTRUMENT, f"Instrument '{ins_name}' not found."
+            )
 
         instrument = self.instantiated_instruments[ins_name]
 

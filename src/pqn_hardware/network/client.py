@@ -128,7 +128,9 @@ class ClientBase:
 
         return ret
 
-    def create_control_packet(self, destination: str, request: Request, payload: dict[str, Any] | None = None) -> Packet:
+    def create_control_packet(
+        self, destination: str, request: Request, payload: dict[str, Any] | None = None
+    ) -> Packet:
         return Packet(
             intent=PacketIntent.CONTROL,
             request=request,

@@ -68,9 +68,7 @@ def network_port() -> int:
         },
     )
     threading.Thread(target=provider.start, daemon=True).start()
-    _wait_until(
-        lambda: PROVIDER_NAME in router.providers, 15, "InstrumentProvider did not register with the Router."
-    )
+    _wait_until(lambda: PROVIDER_NAME in router.providers, 15, "InstrumentProvider did not register with the Router.")
 
     logger.debug("Router and InstrumentProvider are up on port %s", port)
     return port
@@ -159,3 +157,29 @@ def test_proxy_instrument_rejects_positional_operation_arguments(network_port: i
 
     with pytest.raises(TypeError, match="positional arguments"):
         proxy_instrument.set_half_input_int(10)
+
+
+def test_proxy_instrument_rejects_setting_a_parameter_with_more_than_one_value(network_port: int) -> None:
+    client = _client(network_port)
+
+    proxy_instrument = client.get_device(PROVIDER_NAME, "dummy2")
+
+    with pytest.raises(TypeError, match="exactly one value"):
+        proxy_instrument.client.trigger_parameter("param_int", 1, 2)
+
+
+def test_proxy_instrument_get_info(network_port: int) -> None:
+    client = _client(network_port)
+
+    # Uses dummy2 so the test does not depend on the state test_proxy_instrument leaves on dummy1.
+    proxy_instrument = client.get_device(PROVIDER_NAME, "dummy2")
+
+    info = proxy_instrument.info
+
+    # The proxy returns the info as a plain dict, not as a DummyInfo.
+    assert info["name"] == "dummy2"
+    assert info["desc"] == "Dummy instrument2 for testing purposes"
+    assert info["hw_address"] == "5678"
+    # Order-safe under pytest-randomly: compare against a live read of the same parameters.
+    assert info["param_str"] == proxy_instrument.param_str
+    assert info["param_int"] == proxy_instrument.param_int
