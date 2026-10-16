@@ -1058,6 +1058,32 @@ def test_positional_binding_with_a_defaulted_argument(measuring_network_port: in
     assert proxy_instrument.scale(value, factor) == value * factor
 
 
+def test_mixed_positional_and_keyword_arguments(measuring_network_port: int) -> None:
+    client = Client(host=HOST, port=measuring_network_port, router_name=ROUTER_NAME, timeout=10_000)
+
+    proxy_instrument = client.get_device(MEASURING_PROVIDER_NAME, "measuring1")
+    try:
+        # A positional argument and a keyword argument each land on their own name.
+        first = 1
+        second = 2
+        assert proxy_instrument.add(first, second=second) == first * 10 + second
+
+        # A positional argument with a defaulted keyword argument, and a keyword-only call.
+        value = 3
+        factor = 2
+        assert proxy_instrument.scale(value, factor=factor) == value * factor
+        assert proxy_instrument.scale(value=value, factor=factor) == value * factor
+
+        # An argument passed twice, once positionally and once by keyword, still raises.
+        with pytest.raises(TypeError, match="multiple values for argument 'value'"):
+            proxy_instrument.scale(value, value=value)
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        proxy_instrument.close()
+        client.disconnect()
+
+
 def test_positional_arguments_to_an_operation_missing_from_the_device_structure_raise(network_port: int) -> None:
     client = _client(network_port)
 
