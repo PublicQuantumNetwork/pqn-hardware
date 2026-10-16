@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 import zmq
+from pydantic import ValidationError
 
 from pqn_hardware.drivers.dummies import DummyInfo
 from pqn_hardware.drivers.dummies import DummyInstrument
@@ -561,6 +562,73 @@ def test_mismatched_reply_to_is_dropped_and_ask_raises_timeout(caplog: pytest.Lo
     context.term()
 
 
+def test_error_reply_with_a_null_payload_raises(caplog: pytest.LogCaptureFixture) -> None:
+    # An ERROR reply with a null payload is not a valid error reply: validating it raises, and
+    # the reply is never returned to the caller as a success.
+    port = _free_port()
+    context = zmq.Context()
+    server = context.socket(zmq.ROUTER)
+    server.setsockopt(zmq.ROUTER_HANDOVER, 1)
+    server.bind(f"tcp://{HOST}:{port}")
+
+    def serve() -> None:
+        # Registration: echo the request id, with the captured request-id frame.
+        identity, frame, _, data = server.recv_multipart()
+        registration = decode(data)
+        server.send_multipart(
+            [
+                identity,
+                frame,
+                b"",
+                encode(
+                    Packet(
+                        intent=PacketIntent.REGISTRATION_ACK,
+                        request=Request.ACKNOWLEDGE,
+                        source=ROUTER_NAME,
+                        destination=registration.source,
+                        reply_to=registration.id,
+                    )
+                ),
+            ]
+        )
+
+        # An ERROR Packet that answers the request, but carries no ErrorPayload.
+        identity, frame, _, data = server.recv_multipart()
+        request = decode(data)
+        server.send_multipart(
+            [
+                identity,
+                frame,
+                b"",
+                encode(
+                    Packet(
+                        intent=PacketIntent.ERROR,
+                        request=Request.ERROR,
+                        source=PROVIDER_NAME,
+                        destination=request.source,
+                        reply_to=request.id,
+                        payload=None,
+                    )
+                ),
+            ]
+        )
+
+    threading.Thread(target=serve, daemon=True).start()
+
+    client = Client(host=HOST, port=port, router_name=ROUTER_NAME, timeout=1000)
+    try:
+        with (
+            caplog.at_level(logging.WARNING, logger="pqn_hardware.network.client"),
+            pytest.raises(ValidationError),
+        ):
+            client.ping(PROVIDER_NAME)
+    finally:
+        client.disconnect()
+
+    server.close()
+    context.term()
+
+
 def test_instrument_error_raises_packet_error_with_the_error_payload(network_port: int) -> None:
     client = _client(network_port)
 
@@ -879,9 +947,11 @@ def test_dump_argument_returns_json_data() -> None:
     assert _dump_argument(stamp) == {"when": "2026-10-16T12:00:00Z", "label": "kept"}
     # A dataclass class is not a value: it passes through untouched.
     assert _dump_argument(_Stamp) is _Stamp
-    # Values that are not dataclasses pass through as they are.
+    # Values that are not dataclasses pass through as they are, dicts included.
     plain_value = 7
     assert _dump_argument(plain_value) == plain_value
+    plain_mapping = {"a": 1}
+    assert _dump_argument(plain_mapping) == plain_mapping
 
 
 def test_arguments_and_parameter_values_go_through_json_dumping(
@@ -922,6 +992,47 @@ def test_none_arguments_and_parameter_values_travel(measuring_network_port: int)
     assert proxy_instrument.note_param is None
 
 
+def test_dict_argument_travels_unchanged(measuring_network_port: int) -> None:
+    client = Client(host=HOST, port=measuring_network_port, router_name=ROUTER_NAME, timeout=10_000)
+
+    proxy_instrument = client.get_device(MEASURING_PROVIDER_NAME, "measuring1")
+    try:
+        # A plain dict argument is not a dataclass: it passes through untouched, and the
+        # Provider receives it unchanged.
+        mapping = {"a": 1}
+        assert proxy_instrument.record_mapping(mapping) == mapping
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        proxy_instrument.close()
+        client.disconnect()
+
+
+def test_setting_a_typed_parameter_to_none_logs_no_rebuild_warning(
+    measuring_network_port: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    client = Client(host=HOST, port=measuring_network_port, router_name=ROUTER_NAME, timeout=10_000)
+
+    proxy_instrument = client.get_device(MEASURING_PROVIDER_NAME, "measuring1")
+    try:
+        # The Parameter publishes the dataclass type path, and its setter also takes None.
+        written = _Measurement(counts=9)
+        proxy_instrument.optional_measurement_param = written
+        assert proxy_instrument.optional_measurement_param == written
+
+        # Setting it to None sends a SET with a null payload: there is no value to rebuild, so
+        # no rebuild warning is logged.
+        with caplog.at_level(logging.WARNING, logger="pqn_hardware.network.client"):
+            proxy_instrument.optional_measurement_param = None
+
+        assert caplog.records == []
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        proxy_instrument.close()
+        client.disconnect()
+
+
 def test_proxy_instrument_binds_two_positional_arguments_in_order(measuring_network_port: int) -> None:
     client = Client(host=HOST, port=measuring_network_port, router_name=ROUTER_NAME, timeout=10_000)
 
@@ -957,6 +1068,23 @@ def test_positional_arguments_to_an_operation_missing_from_the_device_structure_
     finally:
         proxy_instrument.close()
         client.disconnect()
+
+
+def test_zero_argument_call_to_an_operation_missing_from_the_structure_is_sent(network_port: int) -> None:
+    client = _client(network_port)
+
+    proxy_instrument = client.get_device(PROVIDER_NAME, "dummy2")
+    try:
+        # With no positional arguments there is nothing to bind: the request is sent, and the
+        # Provider's UNKNOWN_OPERATION error comes back as a PacketError, not a local TypeError.
+        with pytest.raises(PacketError) as exc_info:
+            proxy_instrument.client.trigger_operation("no_such_operation")
+    finally:
+        proxy_instrument.close()
+        client.disconnect()
+
+    assert exc_info.value.code == ErrorCode.UNKNOWN_OPERATION
+    assert exc_info.value.origin == PROVIDER_NAME
 
 
 def test_proxy_instrument_without_a_device_structure_rejects_positional_arguments(network_port: int) -> None:
@@ -1618,11 +1746,13 @@ class _MeasuringInstrument(DummyInstrument):
         self.operations["measure"] = self.measure
         self.operations["labels"] = self.labels
         self.operations["record_measurement"] = self.record_measurement
+        self.operations["record_mapping"] = self.record_mapping
         self.operations["record_note"] = self.record_note
         self.operations["add"] = self.add
         self.operations["scale"] = self.scale
-        self.parameters.update({"measurement_param", "note_param"})
+        self.parameters.update({"measurement_param", "note_param", "optional_measurement_param"})
         self._measurement_param = _Measurement(counts=0)
+        self._optional_measurement_param = _Measurement(counts=1)
         self._note: str | None = None
 
     @property
@@ -1632,6 +1762,15 @@ class _MeasuringInstrument(DummyInstrument):
     @measurement_param.setter
     def measurement_param(self, value: _Measurement) -> None:
         self._measurement_param = value
+
+    @property
+    def optional_measurement_param(self) -> _Measurement:
+        return self._optional_measurement_param
+
+    @optional_measurement_param.setter
+    def optional_measurement_param(self, value: _Measurement | None) -> None:
+        # The setter takes None while the getter still publishes the dataclass type path.
+        self._optional_measurement_param = value
 
     @property
     def note_param(self) -> str | None:
@@ -1650,6 +1789,10 @@ class _MeasuringInstrument(DummyInstrument):
     def record_measurement(self, measurement: _Measurement) -> int:
         """Take a dataclass argument; only a rebuilt dataclass has the counts attribute."""
         return measurement.counts
+
+    def record_mapping(self, mapping: dict) -> dict:
+        """Take a plain dict argument, and hand it back unchanged."""
+        return mapping
 
     def record_note(self, note: str | None) -> str | None:
         """Take a required argument that may be None, and hand it back."""
