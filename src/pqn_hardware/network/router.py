@@ -112,11 +112,13 @@ class Router:
                 self.clients[packet.source] = identity_binary
                 logger.info("Client %s registered", identity_binary)
 
+        # The identity frame may not be valid UTF-8 (e.g. libzmq's auto identities); the raw
+        # bytes stay the routing frame, the Packet only needs a readable text destination.
         ack_packet = Packet(
             intent=PacketIntent.REGISTRATION_ACK,
             request=Request.ACKNOWLEDGE,
             source=self.name,
-            destination=identity_binary.decode("utf-8"),
+            destination=identity_binary.decode("utf-8", errors="replace"),
             reply_to=packet.id,
         )
         self._send(identity_binary, ack_packet)
@@ -251,7 +253,9 @@ class Router:
             intent=PacketIntent.ERROR,
             request=Request.ERROR,
             source=self.name,
-            destination=destination.decode("utf-8"),
+            # The identity frame may not be valid UTF-8 (e.g. libzmq's auto identities); the raw
+            # bytes stay the routing frame, the Packet only needs a readable text destination.
+            destination=destination.decode("utf-8", errors="replace"),
             reply_to=reply_to,
             payload=ErrorPayload(code=code, message=message, origin=self.name, details=details or {}).model_dump(),
         )
