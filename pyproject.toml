@@ -52,7 +52,6 @@ ignore = [
     "ANN",  # Let Mypy handle type annotations
     "D1",   # Don't warn about missing docstrings (but lint the ones that exist)
     "FIX",  # The linter doesnt need to remind us about TODOs
-    "S301", # We use pickle
     "TD",   # We don't use this TODO style
 ]
 
