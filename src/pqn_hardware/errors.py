@@ -1,3 +1,6 @@
+from pqn_hardware.network.packet import ErrorPayload
+
+
 class DeviceNotStartedError(Exception):
     def __init__(self, message: str = "Device not started") -> None:
         self.message = message
@@ -29,8 +32,18 @@ class LogDecoratorOutsideOfClassError(Exception):
 
 
 class PacketError(Exception):
-    def __init__(self, message: str = "Packet error") -> None:
+    """An ERROR reply Packet, carrying its ErrorPayload.
+
+    The Payload's code, origin and details are attributes, so callers branch on the error code,
+    never on the message text.
+    """
+
+    def __init__(self, message: str = "Packet error", payload: ErrorPayload | None = None) -> None:
         self.message = message
+        self.payload = payload
+        self.code = payload.code if payload is not None else None
+        self.origin = payload.origin if payload is not None else None
+        self.details = payload.details if payload is not None else {}
         super().__init__(self.message)
 
 

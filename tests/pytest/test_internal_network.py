@@ -14,8 +14,10 @@ from typing import Any
 import pytest
 import zmq
 
+from pqn_hardware.drivers.dummies import DummyInfo
 from pqn_hardware.drivers.dummies import DummyInstrument
 from pqn_hardware.errors import InvalidInstrumentsConfigurationError
+from pqn_hardware.errors import PacketError
 from pqn_hardware.instrument import InstrumentInfo
 from pqn_hardware.network.client import Client
 from pqn_hardware.network.client import ProxyInstrument
@@ -227,6 +229,36 @@ def raw_router() -> Generator[_RawRouter, Any, None]:
     harness.close()
 
 
+MEASURING_PROVIDER_NAME = "pqn_hardware-measuring-provider"
+
+
+@pytest.fixture(scope="module")
+def measuring_network_port() -> int:
+    """Start a Router and a Provider whose Instrument returns a dataclass; return the port."""
+    port = _free_port()
+
+    router = Router(ROUTER_NAME, HOST, port)
+    threading.Thread(target=router.start, daemon=True).start()
+    _wait_until(lambda: router.running, 10, "Router did not start.")
+
+    provider = InstrumentProvider(
+        MEASURING_PROVIDER_NAME,
+        HOST,
+        port,
+        ROUTER_NAME,
+        beat_period=60_000,
+        measuring1={
+            "import": "tests.pytest.test_internal_network._MeasuringInstrument",
+            "desc": "Instrument whose operation returns a dataclass",
+            "hw_address": "1234",
+        },
+    )
+    threading.Thread(target=provider.start, daemon=True).start()
+    _wait_until(lambda: MEASURING_PROVIDER_NAME in router.providers, 15, "Measuring provider did not register.")
+
+    return port
+
+
 def _assert_error_reply(reply: Packet, request: Packet, code: ErrorCode, origin: str) -> ErrorPayload:
     """Assert a reply is an error reply with a code and Origin, echoing the request id."""
     assert reply.intent == PacketIntent.ERROR
@@ -311,13 +343,24 @@ def test_proxy_instrument_operation_with_keyword_arguments(network_port: int) ->
     assert proxy_instrument.param_int == half_input_value
 
 
-def test_proxy_instrument_rejects_positional_operation_arguments(network_port: int) -> None:
+def test_proxy_instrument_binds_positional_arguments_to_names(network_port: int) -> None:
     client = _client(network_port)
 
     proxy_instrument = client.get_device(PROVIDER_NAME, "dummy2")
 
-    with pytest.raises(TypeError, match="positional arguments"):
-        proxy_instrument.set_half_input_int(10)
+    # Positional arguments are bound to their names from the Device structure.
+    input_value = 10
+    half_input_value = input_value // 2
+    assert proxy_instrument.set_half_input_int(input_value) == half_input_value
+    assert proxy_instrument.param_int == half_input_value
+
+    # More positional arguments than the Operation takes is a local TypeError.
+    with pytest.raises(TypeError, match="at most 1 positional argument"):
+        proxy_instrument.set_half_input_int(1, 2)
+
+    # A positional argument repeated by keyword is a local TypeError.
+    with pytest.raises(TypeError, match="multiple values for argument 'value'"):
+        proxy_instrument.set_half_input_int(1, value=2)
 
 
 def test_proxy_instrument_rejects_setting_a_parameter_with_more_than_one_value(network_port: int) -> None:
@@ -337,13 +380,102 @@ def test_proxy_instrument_get_info(network_port: int) -> None:
 
     info = proxy_instrument.info
 
-    # The proxy returns the info as a plain dict, not as a DummyInfo.
-    assert info["name"] == "dummy2"
-    assert info["desc"] == "Dummy instrument2 for testing purposes"
-    assert info["hw_address"] == "5678"
+    # The info is rebuilt from the type path in the Device structure, as the same class.
+    assert isinstance(info, DummyInfo)
+    assert info.name == "dummy2"
+    assert info.desc == "Dummy instrument2 for testing purposes"
+    assert info.hw_address == "5678"
     # Order-safe under pytest-randomly: compare against a live read of the same parameters.
-    assert info["param_str"] == proxy_instrument.param_str
-    assert info["param_int"] == proxy_instrument.param_int
+    assert info.param_str == proxy_instrument.param_str
+    assert info.param_int == proxy_instrument.param_int
+
+
+def test_client_survives_a_timeout_and_the_next_request_succeeds(network_port: int) -> None:
+    # The Router drops a Packet addressed to itself, so the ping gets no reply and times out.
+    client = Client(host=HOST, port=network_port, router_name=ROUTER_NAME, timeout=500)
+
+    with pytest.raises(TimeoutError):
+        client.ping(ROUTER_NAME)
+
+    # Without REQ_RELAXED this request's send would raise EFSM; the next request must succeed.
+    response = client.ping(PROVIDER_NAME)
+    assert response is not None
+    assert response.source == PROVIDER_NAME
+    assert response.request == Request.PONG
+
+
+def test_late_reply_is_dropped_not_returned_to_the_next_request(network_port: int) -> None:
+    client = _client(network_port)
+
+    # toggle_bool sleeps ~1.4 s on the Provider; a proxy with a shorter timeout misses the reply.
+    proxy_instrument = client.get_device(PROVIDER_NAME, "dummy2", timeout_ms=500)
+    param_bool_before = proxy_instrument.param_bool
+
+    with pytest.raises(TimeoutError):
+        proxy_instrument.toggle_bool()
+
+    # The late reply arrives while no request is outstanding; it must be dropped, not queued.
+    time.sleep(2)
+    assert proxy_instrument.param_bool == (not param_bool_before)
+
+    # The next request gets its own reply, never the late reply to toggle_bool.
+    input_value = 36
+    half_input_value = input_value // 2
+    assert proxy_instrument.set_half_input_int(input_value) == half_input_value
+
+
+def test_error_reply_raises_packet_error_with_the_error_payload(network_port: int) -> None:
+    client = _client(network_port)
+    try:
+        with pytest.raises(PacketError) as exc_info:
+            client.ping("no-such-destination")
+    finally:
+        # Close the socket while the Client is alive: a Client that only dies by garbage
+        # collection can block another thread's garbage collection in zmq Context.term().
+        client.disconnect()
+
+    error = exc_info.value
+    assert error.code == ErrorCode.UNKNOWN_DESTINATION
+    assert error.origin == ROUTER_NAME
+    assert error.details == {}
+    assert error.message
+
+
+def test_dataclass_return_value_is_rebuilt_as_its_class(measuring_network_port: int) -> None:
+    client = Client(host=HOST, port=measuring_network_port, router_name=ROUTER_NAME, timeout=10_000)
+
+    proxy_instrument = client.get_device(MEASURING_PROVIDER_NAME, "measuring1")
+
+    ret = proxy_instrument.measure()
+
+    assert isinstance(ret, _Measurement)
+    assert ret == _Measurement(counts=3)
+
+
+def test_unimportable_type_path_falls_back_to_dict(
+    measuring_network_port: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    client = Client(host=HOST, port=measuring_network_port, router_name=ROUTER_NAME, timeout=10_000)
+
+    proxy_instrument = client.get_device(MEASURING_PROVIDER_NAME, "measuring1")
+    proxy_instrument.client.device_structure["operations"]["measure"]["returns_type"] = "no.such.module.NoSuchType"
+
+    with caplog.at_level(logging.WARNING, logger="pqn_hardware.network.client"):
+        ret = proxy_instrument.measure()
+
+    assert ret == {"counts": 3, "label": "counts"}
+    assert any("no.such.module.NoSuchType" in record.message for record in caplog.records)
+
+
+def test_dataclass_argument_is_dumped_to_json(measuring_network_port: int) -> None:
+    client = Client(host=HOST, port=measuring_network_port, router_name=ROUTER_NAME, timeout=10_000)
+
+    proxy_instrument = client.get_device(MEASURING_PROVIDER_NAME, "measuring1")
+
+    # The dataclass argument is dumped to JSON on the wire and rebuilt on the Provider; only a
+    # rebuilt dataclass carries the counts attribute the Operation reads.
+    counts = 5
+    assert proxy_instrument.record_measurement(_Measurement(counts=counts)) == counts
 
 
 def test_error_unknown_instrument(raw_client: _RawClient) -> None:
@@ -977,12 +1109,17 @@ class _MeasuringInstrument(DummyInstrument):
         super().__post_init__()
         self.operations["measure"] = self.measure
         self.operations["labels"] = self.labels
+        self.operations["record_measurement"] = self.record_measurement
 
     def measure(self) -> _Measurement:
         return _Measurement(counts=3)
 
     def labels(self) -> list:
         return ["a", "b"]
+
+    def record_measurement(self, measurement: _Measurement) -> int:
+        """Take a dataclass argument; only a rebuilt dataclass has the counts attribute."""
+        return measurement.counts
 
 
 @dataclass(frozen=True, slots=True)
