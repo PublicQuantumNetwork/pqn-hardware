@@ -497,11 +497,30 @@ def test_mismatched_reply_to_is_dropped_and_ask_raises_timeout(caplog: pytest.Lo
         identity, frame, _, data = server.recv_multipart()
         reply(identity, frame, decode(data), None)
 
-        # A reply whose reply_to matches no request of ours.
+        # An ERROR reply whose reply_to matches no request of ours: it is dropped like any
+        # other mismatched reply, never raised as the answer to this request.
         identity, frame, _, data = server.recv_multipart()
         request = decode(data)
         seen["ping"] = request.id
-        reply(identity, frame, request, "not-the-request-id")
+        server.send_multipart(
+            [
+                identity,
+                frame,
+                b"",
+                encode(
+                    Packet(
+                        intent=PacketIntent.ERROR,
+                        request=Request.ERROR,
+                        source=ROUTER_NAME,
+                        destination=request.source,
+                        reply_to="not-the-request-id",
+                        payload=ErrorPayload(
+                            code=ErrorCode.UNKNOWN_DESTINATION, message="a stale error", origin=ROUTER_NAME
+                        ).model_dump(),
+                    )
+                ),
+            ]
+        )
 
         # The next request gets a reply that answers it.
         identity, frame, _, data = server.recv_multipart()
@@ -521,9 +540,12 @@ def test_mismatched_reply_to_is_dropped_and_ask_raises_timeout(caplog: pytest.Lo
         with pytest.raises(TimeoutError):
             client.ping(PROVIDER_NAME)
 
-        # Each drop warning names the reply's reply_to and the request's id, in that order.
+        # Each drop warning names the reply's reply_to and the request's id, in that order,
+        # and every drop is a warning, never a louder level.
         expected = f"its reply_to not-the-request-id does not match the request id {seen['ping']}"
         assert any(expected in record.message for record in caplog.records)
+        drop_records = [record for record in caplog.records if "does not match the request id" in record.message]
+        assert all(record.levelname == "WARNING" for record in drop_records)
 
         # The Client survives the dropped replies: the next request succeeds on the same socket.
         reply_packet = client.ping(PROVIDER_NAME)
@@ -813,6 +835,21 @@ def test_broken_type_paths_fall_back_to_the_plain_data(
     fallbacks = 3
     assert len(warnings) == fallbacks
     assert all("returning the plain JSON data instead" in warning for warning in warnings)
+
+
+def test_json_native_return_value_logs_no_rebuild_warning(
+    measuring_network_port: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    client = Client(host=HOST, port=measuring_network_port, router_name=ROUTER_NAME, timeout=10_000)
+
+    proxy_instrument = client.get_device(MEASURING_PROVIDER_NAME, "measuring1")
+
+    # A JSON-native return value has a null type path: it is handed back as it is, with no
+    # rebuild and no rebuild warning.
+    with caplog.at_level(logging.WARNING, logger="pqn_hardware.network.client"):
+        assert proxy_instrument.labels() == ["a", "b"]
+
+    assert caplog.records == []
 
 
 def test_dataclass_parameter_round_trips_through_the_proxy(
