@@ -255,6 +255,11 @@ def measuring_network_port() -> int:
             "desc": "Instrument whose operation returns a dataclass",
             "hw_address": "1234",
         },
+        no_info1={
+            "import": "tests.pytest.test_internal_network._NoInfoInstrument",
+            "desc": "Instrument whose info is None",
+            "hw_address": "5678",
+        },
     )
     threading.Thread(target=provider.start, daemon=True).start()
     _wait_until(lambda: MEASURING_PROVIDER_NAME in router.providers, 15, "Measuring provider did not register.")
@@ -683,6 +688,9 @@ def test_router_sends_a_stale_reply_without_the_request_id_frame(network_port: i
     ack = decode(socket.recv())
     assert ack.intent == PacketIntent.REGISTRATION_ACK
     assert ack.reply_to == registration.id
+    # The Router sends the acknowledgement: it names itself as the source.
+    assert ack.source == ROUTER_NAME
+    assert ack.destination == "correlated-test-client"
 
     # A slow request the client does not wait for, then a second request while it runs.
     toggle = Packet(
@@ -728,6 +736,9 @@ def test_registration_for_another_router_replies_malformed_packet(network_port: 
 
         assert reply.intent == PacketIntent.ERROR
         assert reply.reply_to == registration.id
+        # The Router sends the error reply: it names itself as the source.
+        assert reply.source == ROUTER_NAME
+        assert reply.destination == "wrong-router-client"
         payload = ErrorPayload.model_validate(reply.payload)
         assert payload.code == ErrorCode.MALFORMED_PACKET
         assert payload.origin == ROUTER_NAME
@@ -752,7 +763,12 @@ def test_wrong_frame_count_gets_malformed_packet_and_the_router_keeps_running(ne
         source="bad-frames-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
     )
     socket.send(encode(registration))
-    assert decode(socket.recv()).intent == PacketIntent.REGISTRATION_ACK
+    ack = decode(socket.recv())
+    assert ack.intent == PacketIntent.REGISTRATION_ACK
+    # The Router sends the acknowledgement: it names itself as the source.
+    assert ack.source == ROUTER_NAME
+    assert ack.destination == "bad-frames-client"
+    assert ack.reply_to == registration.id
 
     try:
         # More frames than any peer sends (the REQ delimiter plus three data frames).
@@ -762,6 +778,9 @@ def test_wrong_frame_count_gets_malformed_packet_and_the_router_keeps_running(ne
         assert reply.intent == PacketIntent.ERROR
         # There is no request id to echo, so the error reply carries a null reply_to.
         assert reply.reply_to is None
+        # The Router sends the error reply: it names itself as the source.
+        assert reply.source == ROUTER_NAME
+        assert reply.destination == "bad-frames-client"
         payload = ErrorPayload.model_validate(reply.payload)
         assert payload.code == ErrorCode.MALFORMED_PACKET
         assert payload.origin == ROUTER_NAME
@@ -868,11 +887,20 @@ def test_dataclass_argument_is_dumped_to_json(measuring_network_port: int) -> No
     client = Client(host=HOST, port=measuring_network_port, router_name=ROUTER_NAME, timeout=10_000)
 
     proxy_instrument = client.get_device(MEASURING_PROVIDER_NAME, "measuring1")
+    try:
+        # The dataclass argument is dumped to JSON on the wire and rebuilt on the Provider; only
+        # a rebuilt dataclass carries the counts attribute the Operation reads.
+        counts = 5
+        assert proxy_instrument.record_measurement(_Measurement(counts=counts)) == counts
 
-    # The dataclass argument is dumped to JSON on the wire and rebuilt on the Provider; only a
-    # rebuilt dataclass carries the counts attribute the Operation reads.
-    counts = 5
-    assert proxy_instrument.record_measurement(_Measurement(counts=counts)) == counts
+        # A field explicitly set to None travels as None, not dropped for its default.
+        assert proxy_instrument.record_note_of(_Note(note=None)) is None
+        assert proxy_instrument.record_note_of(_Note(note="kept")) == "kept"
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        proxy_instrument.close()
+        client.disconnect()
 
 
 def test_broken_type_paths_fall_back_to_the_plain_data(
@@ -918,6 +946,20 @@ def test_json_native_return_value_logs_no_rebuild_warning(
         assert proxy_instrument.labels() == ["a", "b"]
 
     assert caplog.records == []
+
+
+def test_none_info_comes_back_as_none(measuring_network_port: int) -> None:
+    client = Client(host=HOST, port=measuring_network_port, router_name=ROUTER_NAME, timeout=10_000)
+
+    proxy_instrument = client.get_device(MEASURING_PROVIDER_NAME, "no_info1")
+    try:
+        # An Instrument whose info is None reports None, not an empty mapping.
+        assert proxy_instrument.info is None
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        proxy_instrument.close()
+        client.disconnect()
 
 
 def test_dataclass_parameter_round_trips_through_the_proxy(
@@ -1759,11 +1801,26 @@ class _Measurement:
 
 
 @dataclass(frozen=True, slots=True)
+class _Note:
+    """A dataclass argument with a field that may be explicitly None."""
+
+    note: str | None = "unset"
+
+
+@dataclass(frozen=True, slots=True)
 class _Stamp:
     """A dataclass argument with a field whose python-mode dump is not JSON."""
 
     when: datetime.datetime
     label: str = "kept"
+
+
+class _NoInfoInstrument(DummyInstrument):
+    """An Instrument whose info is None, to exercise a null GET_INFO value."""
+
+    @property
+    def info(self) -> None:
+        return None
 
 
 class _MeasuringInstrument(DummyInstrument):
@@ -1773,6 +1830,7 @@ class _MeasuringInstrument(DummyInstrument):
         self.operations["labels"] = self.labels
         self.operations["record_measurement"] = self.record_measurement
         self.operations["record_mapping"] = self.record_mapping
+        self.operations["record_note_of"] = self.record_note_of
         self.operations["record_note"] = self.record_note
         self.operations["add"] = self.add
         self.operations["scale"] = self.scale
@@ -1815,6 +1873,10 @@ class _MeasuringInstrument(DummyInstrument):
     def record_measurement(self, measurement: _Measurement) -> int:
         """Take a dataclass argument; only a rebuilt dataclass has the counts attribute."""
         return measurement.counts
+
+    def record_note_of(self, value: _Note) -> str | None:
+        """Hand back the dataclass argument's note field, None included."""
+        return value.note
 
     def record_mapping(self, mapping: dict) -> dict:
         """Take a plain dict argument, and hand it back unchanged."""
