@@ -850,18 +850,24 @@ def test_garbage_bytes_get_malformed_packet_and_the_router_keeps_running(network
         context.term()
 
 
-def test_garbage_bytes_from_an_anonymous_dealer_get_malformed_packet(network_port: int) -> None:
-    # A DEALER with no identity set gets one of libzmq's auto identities, which is not UTF-8
-    # text: the Router never crashes on it, and the error reply still arrives on that socket.
+@pytest.mark.parametrize("identity", [None, b"\x00\xff\xfe\xfd"], ids=["auto-identity", "explicit-non-utf8"])
+def test_garbage_bytes_from_a_dealer_with_a_non_utf8_identity_get_malformed_packet(
+    network_port: int, identity: bytes | None
+) -> None:
+    # A DEALER whose identity frame is not UTF-8 text: libzmq's auto identity when none is
+    # set (binary in all but a few random cases), or an explicit binary identity. The Router
+    # never crashes on either, and the error reply still arrives on that socket.
     context = zmq.Context()
     socket = context.socket(zmq.DEALER)
+    if identity is not None:
+        socket.setsockopt(zmq.IDENTITY, identity)
     socket.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
     socket.connect(f"tcp://{HOST}:{network_port}")
 
     # Registering first lets the Router route the follow-up request back to this socket, and
     # exercises the acknowledgement sent to a non-UTF-8 identity frame.
     registration = create_registration_packet(
-        source="anon-dealer-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
+        source="non-utf8-dealer-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
     )
     socket.send(encode(registration))
     _, ack_data = socket.recv_multipart()
@@ -879,15 +885,97 @@ def test_garbage_bytes_from_an_anonymous_dealer_get_malformed_packet(network_por
         assert payload.code == ErrorCode.MALFORMED_PACKET
         assert payload.origin == ROUTER_NAME
 
-        # The Router keeps serving after garbage from the anonymous Dealer.
+        # The Router keeps serving after garbage from the non-UTF-8 identity.
         ping = Packet(
-            intent=PacketIntent.PING, request=Request.PING, source="anon-dealer-client", destination=PROVIDER_NAME
+            intent=PacketIntent.PING,
+            request=Request.PING,
+            source="non-utf8-dealer-client",
+            destination=PROVIDER_NAME,
         )
         socket.send(encode(ping))
         _, pong_data = socket.recv_multipart()
         pong = decode(pong_data)
         assert pong.request == Request.PONG
         assert pong.reply_to == ping.id
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        socket.close()
+        context.term()
+
+
+def test_wrong_version_packets_are_refused_never_handled(network_port: int) -> None:
+    # A wrong-version Packet is refused and never handled: no second reply follows the
+    # UNSUPPORTED_VERSION error, the Provider never receives the Packet, and the sender is
+    # never registered. A Dealer receives every reply the Router sends it, so a second
+    # reply cannot be filtered away by a socket.
+    context = zmq.Context()
+    socket = context.socket(zmq.DEALER)
+    socket.setsockopt(zmq.IDENTITY, b"wrong-version-dealer")
+    socket.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+    socket.connect(f"tcp://{HOST}:{network_port}")
+
+    try:
+        # A version-1 REGISTER addressed to the Router: refused with UNSUPPORTED_VERSION.
+        registration = create_registration_packet(
+            source="wrong-version-dealer", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
+        )
+        wire = json.loads(encode(registration))
+        wire["version"] = 1
+        socket.send(json.dumps(wire).encode("utf-8"))
+        _, error_data = socket.recv_multipart()
+        reply = decode(error_data)
+
+        assert reply.intent == PacketIntent.ERROR
+        assert reply.reply_to == registration.id
+        payload = ErrorPayload.model_validate(reply.payload)
+        assert payload.code == ErrorCode.UNSUPPORTED_VERSION
+        assert payload.origin == ROUTER_NAME
+        assert payload.details == {"expected": PROTOCOL_VERSION, "received": 1}
+
+        # No REGISTRATION_ACK follows the error: the REGISTER was never handled, so the
+        # sender was never registered.
+        with pytest.raises(zmq.error.Again):
+            socket.recv_multipart()
+
+        # A version-1 PING addressed to the Provider: refused, never forwarded, so the
+        # Provider never replies.
+        ping = Packet(
+            intent=PacketIntent.PING, request=Request.PING, source="wrong-version-dealer", destination=PROVIDER_NAME
+        )
+        wire = json.loads(encode(ping))
+        wire["version"] = 1
+        socket.send(json.dumps(wire).encode("utf-8"))
+        _, error_data = socket.recv_multipart()
+        reply = decode(error_data)
+
+        assert reply.intent == PacketIntent.ERROR
+        assert reply.reply_to == ping.id
+        payload = ErrorPayload.model_validate(reply.payload)
+        assert payload.code == ErrorCode.UNSUPPORTED_VERSION
+        assert payload.origin == ROUTER_NAME
+
+        # No PONG follows the error: the Provider never received the PING.
+        with pytest.raises(zmq.error.Again):
+            socket.recv_multipart()
+
+        # The sender was never registered: a v2 Packet addressed to its name is refused with
+        # UNKNOWN_DESTINATION instead of being routed back to it.
+        probe = Packet(
+            intent=PacketIntent.PING,
+            request=Request.PING,
+            source="wrong-version-dealer",
+            destination="wrong-version-dealer",
+        )
+        socket.send(encode(probe))
+        _, error_data = socket.recv_multipart()
+        reply = decode(error_data)
+
+        assert reply.intent == PacketIntent.ERROR
+        assert reply.reply_to == probe.id
+        payload = ErrorPayload.model_validate(reply.payload)
+        assert payload.code == ErrorCode.UNKNOWN_DESTINATION
+        assert payload.origin == ROUTER_NAME
     finally:
         # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
         # context that outlives its socket can block the interpreter at exit in zmq term().
