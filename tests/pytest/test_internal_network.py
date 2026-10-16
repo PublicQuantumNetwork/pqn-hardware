@@ -16,6 +16,7 @@ import zmq
 
 from pqn_hardware.drivers.dummies import DummyInstrument
 from pqn_hardware.errors import InvalidInstrumentsConfigurationError
+from pqn_hardware.instrument import InstrumentInfo
 from pqn_hardware.network.client import Client
 from pqn_hardware.network.client import ProxyInstrument
 from pqn_hardware.network.instrument_provider import InstrumentProvider
@@ -165,6 +166,16 @@ class _RawRouter:
                 "import": "tests.pytest.test_internal_network._MeasuringInstrument",
                 "desc": "Instrument whose operations return dataclasses and lists",
                 "hw_address": "5678",
+            },
+            shapes1={
+                "import": "tests.pytest.test_internal_network._ShapesInstrument",
+                "desc": "Instrument exercising Device-structure shapes",
+                "hw_address": "1111",
+            },
+            raising1={
+                "import": "tests.pytest.test_internal_network._RaisingInstrument",
+                "desc": "Instrument whose driver access raises",
+                "hw_address": "2222",
             },
         )
         threading.Thread(target=provider.start, daemon=True).start()
@@ -703,6 +714,170 @@ def test_dataclass_return_value_publishes_its_type_path(raw_router: _RawRouter) 
     assert call_reply.payload == {"value": {"counts": 3, "label": "counts"}}
 
 
+def test_device_structure_parameter_metadata(raw_router: _RawRouter) -> None:
+    request = Packet(
+        intent=PacketIntent.DATA,
+        request=Request.GET_DEVICE_STRUCTURE,
+        source="some-client",
+        destination=RAW_PROVIDER_NAME,
+        payload=GetDeviceStructurePayload(instrument="shapes1").model_dump(),
+    )
+
+    reply = raw_router.ask(request)
+    parameters = reply.payload["parameters"]
+
+    # A getter-only property is a read-only Parameter.
+    assert parameters["read_only"]["writable"] is False
+    assert parameters["read_only"]["schema"] == {"type": "integer"}
+    # A Parameter that is a plain attribute carries no type hints, but is writable.
+    assert parameters["recorded"]["writable"] is True
+    assert parameters["recorded"]["schema"] == {}
+    # A write-only property publishes its setter's type hint as the schema.
+    assert parameters["write_only"]["writable"] is True
+    assert parameters["write_only"]["schema"] == {"type": "integer"}
+    # A dataclass Parameter publishes its Python import path (ADR-0002), also through a string
+    # (forward reference) annotation.
+    assert parameters["measurement_param"]["type"] == "tests.pytest.test_internal_network._Measurement"
+    assert parameters["measurement_param"]["schema"]["type"] == "object"
+    assert parameters["forward_ref_param"]["type"] == "tests.pytest.test_internal_network._Measurement"
+    assert parameters["forward_ref_param"]["schema"]["type"] == "object"
+    # A bare dict is JSON-native: a schema, but no type path.
+    assert parameters["dict_param"]["type"] is None
+    assert parameters["dict_param"]["schema"] == {"additionalProperties": True, "type": "object"}
+    # A Parameter hinted with a base dataclass publishes the hinted type's path.
+    assert parameters["wide_param"]["type"] == "pqn_hardware.instrument.InstrumentInfo"
+
+    operations = reply.payload["operations"]
+    # Variadic parameters are not Operation arguments on the wire.
+    assert set(operations["variadic"]["args_schema"]["properties"]) == {"value"}
+    assert operations["variadic"]["args_schema"]["required"] == ["value"]
+    # A bare dict return type is JSON-native: a schema, but no type path.
+    assert operations["mapping"]["returns_type"] is None
+    assert operations["mapping"]["returns_schema"] == {"additionalProperties": True, "type": "object"}
+
+
+def test_operation_argument_binding(raw_router: _RawRouter) -> None:
+    # An argument with a default can be omitted; the defaulted value reaches the driver.
+    defaulted = Packet(
+        intent=PacketIntent.CONTROL,
+        request=Request.CALL_OPERATION,
+        source="some-client",
+        destination=RAW_PROVIDER_NAME,
+        payload=CallOperationPayload(instrument="shapes1", operation="record").model_dump(),
+    )
+    assert raw_router.ask(defaulted).payload == {"value": 7}
+
+    # A string for an int argument is coerced, and the driver receives the validated int.
+    coerced = Packet(
+        intent=PacketIntent.CONTROL,
+        request=Request.CALL_OPERATION,
+        source="some-client",
+        destination=RAW_PROVIDER_NAME,
+        payload=CallOperationPayload(instrument="shapes1", operation="record", kwargs={"value": "3"}).model_dump(),
+    )
+    assert raw_router.ask(coerced).payload == {"value": 3}
+    recorded = Packet(
+        intent=PacketIntent.CONTROL,
+        request=Request.GET_PARAMETER,
+        source="some-client",
+        destination=RAW_PROVIDER_NAME,
+        payload=GetParameterPayload(instrument="shapes1", parameter="recorded").model_dump(),
+    )
+    assert raw_router.ask(recorded).payload == {"value": 3}
+
+    # An Operation with variadic parameters is called with its named arguments only.
+    variadic = Packet(
+        intent=PacketIntent.CONTROL,
+        request=Request.CALL_OPERATION,
+        source="some-client",
+        destination=RAW_PROVIDER_NAME,
+        payload=CallOperationPayload(instrument="shapes1", operation="variadic", kwargs={"value": 2}).model_dump(),
+    )
+    assert raw_router.ask(variadic).payload == {"value": 2}
+
+
+def test_values_are_serialized_through_their_type_hint(raw_router: _RawRouter) -> None:
+    # Each reply carries only the hinted type's fields, not the subclass's extra field.
+    hinted_fields = {"name": "wide", "desc": "", "hw_address": "", "hw_status": {}}
+
+    call = Packet(
+        intent=PacketIntent.CONTROL,
+        request=Request.CALL_OPERATION,
+        source="some-client",
+        destination=RAW_PROVIDER_NAME,
+        payload=CallOperationPayload(instrument="shapes1", operation="wide_info").model_dump(),
+    )
+    assert raw_router.ask(call).payload["value"] == hinted_fields
+
+    read = Packet(
+        intent=PacketIntent.CONTROL,
+        request=Request.GET_PARAMETER,
+        source="some-client",
+        destination=RAW_PROVIDER_NAME,
+        payload=GetParameterPayload(instrument="shapes1", parameter="wide_param").model_dump(),
+    )
+    assert raw_router.ask(read).payload["value"] == hinted_fields
+
+    info = Packet(
+        intent=PacketIntent.CONTROL,
+        request=Request.GET_INFO,
+        source="some-client",
+        destination=RAW_PROVIDER_NAME,
+        payload=GetInfoPayload(instrument="shapes1").model_dump(),
+    )
+    assert raw_router.ask(info).payload["value"] == {**hinted_fields, "name": "shapes"}
+
+
+def test_instrument_error_on_raising_driver_access(raw_router: _RawRouter) -> None:
+    broken_read = Packet(
+        intent=PacketIntent.CONTROL,
+        request=Request.GET_PARAMETER,
+        source="some-client",
+        destination=RAW_PROVIDER_NAME,
+        payload=GetParameterPayload(instrument="raising1", parameter="broken_read").model_dump(),
+    )
+    payload = _assert_error_reply(
+        raw_router.ask(broken_read), broken_read, ErrorCode.INSTRUMENT_ERROR, RAW_PROVIDER_NAME
+    )
+    assert payload.details["exception_type"] == "RuntimeError"
+    assert "broken read" in payload.details["exception"]
+
+    broken_write = Packet(
+        intent=PacketIntent.CONTROL,
+        request=Request.SET_PARAMETER,
+        source="some-client",
+        destination=RAW_PROVIDER_NAME,
+        payload=SetParameterPayload(instrument="raising1", parameter="broken_write", value=1).model_dump(),
+    )
+    payload = _assert_error_reply(
+        raw_router.ask(broken_write), broken_write, ErrorCode.INSTRUMENT_ERROR, RAW_PROVIDER_NAME
+    )
+    assert payload.details["exception_type"] == "RuntimeError"
+    assert "broken write" in payload.details["exception"]
+
+    broken_info = Packet(
+        intent=PacketIntent.CONTROL,
+        request=Request.GET_INFO,
+        source="some-client",
+        destination=RAW_PROVIDER_NAME,
+        payload=GetInfoPayload(instrument="raising1").model_dump(),
+    )
+    payload = _assert_error_reply(
+        raw_router.ask(broken_info), broken_info, ErrorCode.INSTRUMENT_ERROR, RAW_PROVIDER_NAME
+    )
+    assert payload.details["exception_type"] == "RuntimeError"
+    assert "broken info" in payload.details["exception"]
+
+    # The Provider keeps serving after driver errors.
+    follow_up = Packet(
+        intent=PacketIntent.DATA,
+        request=Request.GET_DEVICES,
+        source="some-client",
+        destination=RAW_PROVIDER_NAME,
+    )
+    assert "dummy1" in raw_router.ask(follow_up).payload["devices"]
+
+
 def test_return_values_are_serialized_via_the_return_annotation(raw_client: _RawClient) -> None:
     # Uses dummy2 and sets its state first, so the test does not depend on other tests' order.
     input_value = 30
@@ -810,6 +985,121 @@ class _MeasuringInstrument(DummyInstrument):
         return ["a", "b"]
 
 
+@dataclass(frozen=True, slots=True)
+class _WideInfo(InstrumentInfo):
+    """An InstrumentInfo subclass with an extra field, to test serialization via the hinted type."""
+
+    extra: str = "extra"
+
+
+class _ShapesInstrument(DummyInstrument):
+    """An Instrument whose Parameters and Operations exercise every Device-structure shape."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        # A Parameter that is a plain attribute, not a property: no type hints, but writable.
+        self.recorded: int | None = None
+        self.parameters.update(
+            {
+                "read_only",
+                "recorded",
+                "write_only",
+                "measurement_param",
+                "dict_param",
+                "forward_ref_param",
+                "wide_param",
+            }
+        )
+        self.operations.update(
+            {"record": self.record, "variadic": self.variadic, "mapping": self.mapping, "wide_info": self.wide_info}
+        )
+
+    @property
+    def read_only(self) -> int:
+        return 1
+
+    def _set_write_only(self, value: int) -> None:
+        self.recorded = value
+
+    # A write-only property: reading it is not part of the Parameter's contract.
+    write_only = property(fset=_set_write_only)
+
+    @property
+    def measurement_param(self) -> _Measurement:
+        return _Measurement(counts=1)
+
+    @property
+    def dict_param(self) -> dict:
+        return {"a": 1}
+
+    @property
+    def forward_ref_param(self) -> "_Measurement":
+        return _Measurement(counts=2)
+
+    @property
+    def wide_param(self) -> InstrumentInfo:
+        return _WideInfo(name="wide")
+
+    def record(self, value: int = 7) -> int:
+        """Store the validated argument, so the test can read it back."""
+        self.recorded = value
+        return value
+
+    def variadic(self, value: int, *args: int, **kwargs: int) -> int:
+        return value + sum(args) + sum(kwargs.values())
+
+    def mapping(self) -> dict:
+        return {"a": 1}
+
+    def wide_info(self) -> InstrumentInfo:
+        return _WideInfo(name="wide")
+
+    @property
+    def info(self) -> InstrumentInfo:
+        return _WideInfo(name="shapes")
+
+
+class _RaisingInstrument(DummyInstrument):
+    """An Instrument whose driver access raises, to test INSTRUMENT_ERROR replies."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.parameters.update({"broken_read", "broken_write"})
+
+    @property
+    def broken_read(self) -> int:
+        msg = "broken read"
+        raise RuntimeError(msg)
+
+    @property
+    def broken_write(self) -> int:
+        return 0
+
+    @broken_write.setter
+    def broken_write(self, _value: int) -> None:
+        msg = "broken write"
+        raise RuntimeError(msg)
+
+    @property
+    def info(self) -> InstrumentInfo:
+        msg = "broken info"
+        raise RuntimeError(msg)
+
+
+class _UnresolvableParameterInstrument(DummyInstrument):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.parameters.add("unresolvable_param")
+
+    @property
+    def unresolvable_param(self) -> "_NoSuchType": ...  # noqa: F821 - the hint must stay unresolvable
+
+
+class _UnresolvableInfoInstrument(DummyInstrument):
+    @property
+    def info(self) -> "_NoSuchType": ...  # noqa: F821 - the hint must stay unresolvable
+
+
 def test_startup_fails_when_an_operation_type_hint_cannot_produce_a_json_schema() -> None:
     provider = InstrumentProvider(
         "bad-hints-provider",
@@ -876,4 +1166,38 @@ def test_startup_fails_when_a_type_hint_cannot_be_resolved() -> None:
     )
 
     with pytest.raises(InvalidInstrumentsConfigurationError, match="unresolvable"):
+        provider.start()
+
+
+def test_startup_fails_when_a_parameter_hint_cannot_be_resolved() -> None:
+    provider = InstrumentProvider(
+        "bad-hints-provider",
+        HOST,
+        _free_port(),
+        ROUTER_NAME,
+        bad={
+            "import": "tests.pytest.test_internal_network._UnresolvableParameterInstrument",
+            "desc": "Instrument with an unresolvable parameter hint",
+            "hw_address": "1234",
+        },
+    )
+
+    with pytest.raises(InvalidInstrumentsConfigurationError, match="unresolvable_param"):
+        provider.start()
+
+
+def test_startup_fails_when_the_info_hint_cannot_be_resolved() -> None:
+    provider = InstrumentProvider(
+        "bad-hints-provider",
+        HOST,
+        _free_port(),
+        ROUTER_NAME,
+        bad={
+            "import": "tests.pytest.test_internal_network._UnresolvableInfoInstrument",
+            "desc": "Instrument with an unresolvable info hint",
+            "hw_address": "1234",
+        },
+    )
+
+    with pytest.raises(InvalidInstrumentsConfigurationError, match="info"):
         provider.start()
