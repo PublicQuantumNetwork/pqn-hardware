@@ -1,10 +1,18 @@
 import datetime
 import importlib
+import inspect
 import logging
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 from typing import Any
 
 import zmq
+from pydantic import BaseModel
+from pydantic import ConfigDict
+from pydantic import TypeAdapter
+from pydantic import ValidationError
+from pydantic import create_model
+from pydantic.errors import PydanticUserError
 
 from pqn_hardware.errors import CouldNotConnectToNetworkElementError
 from pqn_hardware.errors import InvalidInstrumentsConfigurationError
@@ -30,6 +38,84 @@ if TYPE_CHECKING:
     from pqn_hardware.instrument import Instrument
 
 logger = logging.getLogger(__name__)
+
+# Types JSON represents natively; every other type is published with its Python import path (ADR-0002).
+_JSON_NATIVE_TYPES = frozenset({type(None), bool, int, float, str})
+
+
+def _type_path(annotation: Any) -> str | None:
+    """Return the Python import path of a type hint, or None when the type is JSON-native (ADR-0002)."""
+    if isinstance(annotation, type) and annotation not in _JSON_NATIVE_TYPES:
+        return f"{annotation.__module__}.{annotation.__qualname__}"
+    return None
+
+
+def _annotated(annotation: Any) -> Any:
+    """Return an inspect annotation, with the "no annotation" sentinel mapped to Any."""
+    return annotation if annotation is not inspect.Parameter.empty else Any
+
+
+def _arguments_model(operation: Callable[..., Any]) -> type[BaseModel]:
+    """Build a model of an Operation's keyword arguments from its type hints.
+
+    This is the same arguments model pydantic's validate_call builds internally for the callable.
+    """
+    fields: dict[str, Any] = {}
+    for name, parameter in inspect.signature(operation, eval_str=True).parameters.items():
+        if parameter.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+            continue
+        default = ... if parameter.default is inspect.Parameter.empty else parameter.default
+        fields[name] = (_annotated(parameter.annotation), default)
+    return create_model("Arguments", __config__=ConfigDict(extra="forbid"), **fields)
+
+
+def _return_annotation(operation: Callable[..., Any]) -> Any:
+    """Return the return type hint of an Operation, or Any when it has none."""
+    return _annotated(inspect.signature(operation, eval_str=True).return_annotation)
+
+
+def _getter_return_annotation(prop: property) -> Any:
+    """Return the return type hint of a property's getter, or Any when it has none."""
+    getter = prop.fget
+    if getter is None:
+        return Any
+    return _annotated(inspect.signature(getter, eval_str=True).return_annotation)
+
+
+def _setter_value_annotation(prop: property) -> Any:
+    """Return the type hint of the value a property's setter takes, or Any when it has none."""
+    setter = prop.fset
+    if setter is None:
+        return Any
+    parameters = list(inspect.signature(setter, eval_str=True).parameters.values())
+    # The value is the setter's second parameter, after the instrument itself.
+    value_parameter = 1
+    if len(parameters) <= value_parameter:
+        return Any
+    return _annotated(parameters[value_parameter].annotation)
+
+
+def _parameter_annotations(instrument_class: type, parameter: str) -> tuple[Any, Any | None, bool]:
+    """Return the (read, write) type hints and the writability of a Parameter, from its property.
+
+    A Parameter that is not a property carries no type hints; its values pass through unvalidated.
+    """
+    prop = getattr(instrument_class, parameter, None)
+    if not isinstance(prop, property):
+        return Any, None, True
+    read = _getter_return_annotation(prop) if prop.fget is not None else None
+    write = _setter_value_annotation(prop) if prop.fset is not None else None
+    if read is None:
+        read = write if write is not None else Any
+    return read, write, prop.fset is not None
+
+
+def _info_annotation(instrument_class: type) -> Any:
+    """Return the return type hint of an Instrument's info, or Any when it has none."""
+    prop = getattr(instrument_class, "info", None)
+    if isinstance(prop, property) and prop.fget is not None:
+        return _getter_return_annotation(prop)
+    return Any
 
 
 class InstrumentProvider:
@@ -106,6 +192,12 @@ class InstrumentProvider:
 
         self.instruments = instruments
         self.instantiated_instruments: dict[str, Instrument] = {}
+        # The Device structure of every Instrument, built at startup (ADR-0002).
+        self.device_structures: dict[str, dict[str, Any]] = {}
+        # The type machinery used to validate arguments and values and to serialize return values.
+        self._operation_types: dict[str, dict[str, tuple[type[BaseModel], TypeAdapter[Any]]]] = {}
+        self._parameter_types: dict[str, dict[str, tuple[TypeAdapter[Any], TypeAdapter[Any] | None]]] = {}
+        self._info_types: dict[str, TypeAdapter[Any]] = {}
 
         self.running = False
 
@@ -135,8 +227,80 @@ class InstrumentProvider:
             self.instantiated_instruments[ins_name] = ins
             logger.info("Successfully instantiated %s", ins_name)
 
+    def _build_device_types(self) -> None:
+        """Build the Device structure and the type adapters of every Instrument.
+
+        A driver type hint that cannot produce a JSON Schema fails here, at startup, as a configuration
+        error instead of failing at call time (ADR-0002).
+        """
+        for ins_name, instrument in self.instantiated_instruments.items():
+            self._build_instrument_types(ins_name, instrument)
+
+    def _build_instrument_types(self, ins_name: str, instrument: "Instrument") -> None:
+        """Build the Device structure and the type adapters of one Instrument."""
+        operations: dict[str, dict[str, Any]] = {}
+        operation_types: dict[str, tuple[type[BaseModel], TypeAdapter[Any]]] = {}
+        for op_name, operation in instrument.operations.items():
+            returns_annotation = _return_annotation(operation)
+            try:
+                arguments_model = _arguments_model(operation)
+                returns_adapter = TypeAdapter(returns_annotation)
+                args_schema = arguments_model.model_json_schema()
+                returns_schema = returns_adapter.json_schema()
+            except PydanticUserError as e:
+                msg = (
+                    f"Type hints of operation '{op_name}' in instrument '{ins_name}' cannot produce a JSON Schema: {e}"
+                )
+                raise InvalidInstrumentsConfigurationError(msg) from e
+            operations[op_name] = {
+                "args_schema": args_schema,
+                "returns_schema": returns_schema,
+                "returns_type": _type_path(returns_annotation),
+            }
+            operation_types[op_name] = (arguments_model, returns_adapter)
+
+        parameters: dict[str, dict[str, Any]] = {}
+        parameter_types: dict[str, tuple[TypeAdapter[Any], TypeAdapter[Any] | None]] = {}
+        for param_name in instrument.parameters:
+            read_annotation, write_annotation, writable = _parameter_annotations(type(instrument), param_name)
+            try:
+                read_adapter = TypeAdapter(read_annotation)
+                write_adapter = TypeAdapter(write_annotation) if write_annotation is not None else None
+                schema = read_adapter.json_schema()
+            except PydanticUserError as e:
+                msg = f"Type hints of parameter '{param_name}' in instrument '{ins_name}' cannot produce a JSON Schema: {e}"
+                raise InvalidInstrumentsConfigurationError(msg) from e
+            parameters[param_name] = {
+                "schema": schema,
+                "type": _type_path(read_annotation),
+                "writable": writable,
+            }
+            parameter_types[param_name] = (read_adapter, write_adapter)
+
+        info_annotation = _info_annotation(type(instrument))
+        try:
+            info_adapter = TypeAdapter(info_annotation)
+            info_schema = info_adapter.json_schema()
+        except PydanticUserError as e:
+            msg = f"The info type hint of instrument '{ins_name}' cannot produce a JSON Schema: {e}"
+            raise InvalidInstrumentsConfigurationError(msg) from e
+
+        self.device_structures[ins_name] = {
+            "name": instrument.name,
+            "desc": instrument.desc,
+            "hw_address": instrument.hw_address,
+            "type": f"{type(instrument).__module__}.{type(instrument).__qualname__}",
+            "info": {"schema": info_schema, "type": _type_path(info_annotation)},
+            "operations": operations,
+            "parameters": parameters,
+        }
+        self._operation_types[ins_name] = operation_types
+        self._parameter_types[ins_name] = parameter_types
+        self._info_types[ins_name] = info_adapter
+
     def start(self) -> None:
         self.instantiate_instruments()
+        self._build_device_types()
 
         logger.info("Starting provider %s at %s", self.name, self.address)
         self.context = zmq.Context()
@@ -165,44 +329,107 @@ class InstrumentProvider:
                     self._beat()
                     continue
 
-                match packet.intent:
-                    case PacketIntent.PING:
-                        response = self._handle_ping(packet)
-                        self.socket.send(encode(response))
+                if packet is None:
+                    # _listen already replied to input it could not handle.
+                    continue
 
-                    case PacketIntent.REGISTRATION_ACK:
-                        self._handle_reg_acknowledge()
+                try:
+                    response = self._handle_packet(packet)
+                except ValidationError as e:
+                    response = self._create_error_packet(
+                        packet,
+                        ErrorCode.MALFORMED_PACKET,
+                        f"Payload does not match request '{packet.request}': {e}",
+                    )
 
-                    case PacketIntent.DATA:
-                        match packet.request:
-                            case Request.GET_DEVICES:
-                                response = self._handle_get_devices(packet)
-                                self.socket.send(encode(response))
-
-                            case Request.GET_DEVICE_STRUCTURE:
-                                response = self._handle_get_device_structure(packet)
-                                self.socket.send(encode(response))
-
-                    case PacketIntent.CONTROL:
-                        response = self._handle_instrument_control(packet)
-                        self.socket.send(encode(response))
+                if response is not None:
+                    self.socket.send(encode(response))
 
         finally:
             self.socket.close()
 
-    def _listen(self) -> Packet:
+    def _handle_packet(self, packet: Packet) -> Packet | None:
+        """Dispatch an incoming Packet on its Intent. None means no reply."""
+        match packet.intent:
+            case PacketIntent.PING:
+                return self._handle_ping(packet)
+
+            case PacketIntent.REGISTRATION_ACK:
+                self._handle_reg_acknowledge()
+                return None
+
+            case PacketIntent.DATA:
+                return self._handle_data(packet)
+
+            case PacketIntent.CONTROL:
+                return self._handle_instrument_control(packet)
+
+            case _:
+                return self._create_error_packet(
+                    packet, ErrorCode.UNSUPPORTED_REQUEST, f"Unsupported request '{packet.request}'"
+                )
+
+    def _handle_data(self, packet: Packet) -> Packet:
+        """Answer a DATA request the Provider handles; any other request verb is unsupported."""
+        match packet.request:
+            case Request.GET_DEVICES:
+                return self._handle_get_devices(packet)
+
+            case Request.GET_DEVICE_STRUCTURE:
+                return self._handle_get_device_structure(packet)
+
+            case _:
+                return self._create_error_packet(
+                    packet, ErrorCode.UNSUPPORTED_REQUEST, f"Unsupported request '{packet.request}'"
+                )
+
+    def _listen(self) -> Packet | None:
+        """Receive one Packet. Bad input or a misaddressed Packet gets an error reply and returns None."""
         # This should never happen, but mypy complains if the check is not done
         if self.socket is None:
             msg = "Socket is None, cannot listen."
             logger.error(msg)
             raise RuntimeError(msg)
 
-        _, data = self.socket.recv_multipart()
-        packet = decode(data)
+        # The Router sends [delimiter, data] to a DEALER socket.
+        dealer_parts = 2
+        frames = self.socket.recv_multipart()
+        if len(frames) != dealer_parts:
+            self.socket.send(
+                encode(
+                    self._create_error_packet(
+                        None, ErrorCode.MALFORMED_PACKET, f"Expected {dealer_parts} frames, got {len(frames)}."
+                    )
+                )
+            )
+            return None
+
+        _, data = frames
+        try:
+            packet = decode(data)
+        except ValidationError as e:
+            self.socket.send(
+                encode(
+                    self._create_error_packet(
+                        None,
+                        ErrorCode.MALFORMED_PACKET,
+                        f"Packet is not valid JSON for this protocol (a pre-v2 pickle peer sends non-JSON bytes): {e}",
+                    )
+                )
+            )
+            return None
+
         if packet.destination != self.name:
-            # FIXME: This should return an error packet instead of just crashing
-            msg = f"Packet intended for {packet.destination} but received by {self.name}. Packet: {packet}"
-            raise RuntimeError(msg)
+            self.socket.send(
+                encode(
+                    self._create_error_packet(
+                        packet,
+                        ErrorCode.WRONG_DESTINATION,
+                        f"Packet addressed to '{packet.destination}' but received by '{self.name}'.",
+                    )
+                )
+            )
+            return None
 
         logger.info("Received packet: %s", packet)
 
@@ -255,6 +482,7 @@ class InstrumentProvider:
             request=Request.PONG,
             source=self.name,
             destination=packet.source,
+            reply_to=packet.id,
             payload=None,
         )
 
@@ -272,6 +500,7 @@ class InstrumentProvider:
             request=Request.GET_DEVICES,
             source=self.name,
             destination=packet.source,
+            reply_to=packet.id,
             payload=DevicesPayload(devices=devices).model_dump(),
         )
 
@@ -281,25 +510,16 @@ class InstrumentProvider:
 
         if ins_name not in self.instantiated_instruments:
             return self._create_error_packet(
-                packet.source, ErrorCode.UNKNOWN_INSTRUMENT, f"Instrument '{ins_name}' not found."
+                packet, ErrorCode.UNKNOWN_INSTRUMENT, f"Instrument '{ins_name}' not found."
             )
-
-        instrument = self.instantiated_instruments[ins_name]
-
-        payload = {
-            "name": instrument.name,
-            "desc": instrument.desc,
-            "hw_address": instrument.hw_address,
-            "parameters": sorted(instrument.parameters),
-            "operations": sorted(instrument.operations),
-        }
 
         return Packet(
             intent=PacketIntent.DATA,
             request=Request.GET_DEVICE_STRUCTURE,
             source=self.name,
             destination=packet.source,
-            payload=payload,
+            reply_to=packet.id,
+            payload=self.device_structures[ins_name],
         )
 
     def _handle_operation_control(self, packet: Packet) -> Packet:
@@ -307,91 +527,138 @@ class InstrumentProvider:
 
         if request_payload.instrument not in self.instantiated_instruments:
             return self._create_error_packet(
-                packet.source, ErrorCode.UNKNOWN_INSTRUMENT, f"Instrument '{request_payload.instrument}' not found."
+                packet, ErrorCode.UNKNOWN_INSTRUMENT, f"Instrument '{request_payload.instrument}' not found."
             )
         instrument = self.instantiated_instruments[request_payload.instrument]
 
         if request_payload.operation not in instrument.operations:
             return self._create_error_packet(
-                packet.source,
+                packet,
                 ErrorCode.UNKNOWN_OPERATION,
                 f"Operation '{request_payload.operation}' not found in '{instrument.name}'",
             )
 
+        arguments_model, returns_adapter = self._operation_types[request_payload.instrument][request_payload.operation]
+
         try:
-            operation_ret = instrument.operations[request_payload.operation](**request_payload.kwargs)
+            arguments = arguments_model.model_validate(request_payload.kwargs)
+            kwargs = {name: getattr(arguments, name) for name in arguments_model.model_fields}
+        except ValidationError as e:
+            msg = f"Invalid arguments for operation '{request_payload.operation}' in '{instrument.name}'. Error: {e}"
+            return self._create_error_packet(packet, ErrorCode.INVALID_ARGUMENTS, msg)
+
+        try:
+            operation_ret = instrument.operations[request_payload.operation](**kwargs)
+            value = returns_adapter.dump_python(operation_ret, mode="json")
         # Adding ruff exception due to not know what type of exceptions instruments can raise.
         except Exception as e:  # noqa:BLE001
             msg = f"Error executing operation '{request_payload.operation}' in '{instrument.name}'. Error: {e}"
-            return self._create_error_packet(packet.source, ErrorCode.INSTRUMENT_ERROR, msg)
+            return self._create_error_packet(
+                packet,
+                ErrorCode.INSTRUMENT_ERROR,
+                msg,
+                details={"exception_type": type(e).__name__, "exception": str(e)},
+            )
 
-        return self._create_control_packet(
-            packet.source, Request.CALL_OPERATION, ValuePayload(value=operation_ret).model_dump()
-        )
+        return self._create_control_packet(packet, Request.CALL_OPERATION, ValuePayload(value=value).model_dump())
 
     def _handle_parameter_read(self, packet: Packet) -> Packet:
         request_payload = GetParameterPayload.model_validate(packet.payload)
 
         if request_payload.instrument not in self.instantiated_instruments:
             return self._create_error_packet(
-                packet.source, ErrorCode.UNKNOWN_INSTRUMENT, f"Instrument '{request_payload.instrument}' not found."
+                packet, ErrorCode.UNKNOWN_INSTRUMENT, f"Instrument '{request_payload.instrument}' not found."
             )
         instrument = self.instantiated_instruments[request_payload.instrument]
 
         if request_payload.parameter not in instrument.parameters:
             return self._create_error_packet(
-                packet.source,
+                packet,
                 ErrorCode.UNKNOWN_PARAMETER,
                 f"Parameter '{request_payload.parameter}' not found in '{instrument.name}'",
             )
 
+        read_adapter, _ = self._parameter_types[request_payload.instrument][request_payload.parameter]
+
         try:
             parameter_ret = getattr(instrument, request_payload.parameter)
-        except AttributeError as e:
+            value = read_adapter.dump_python(parameter_ret, mode="json")
+        # Adding ruff exception due to not know what type of exceptions instruments can raise.
+        except Exception as e:  # noqa:BLE001
             msg = f"Error reading parameter '{request_payload.parameter}' in '{instrument.name}'. Error: {e}"
-            return self._create_error_packet(packet.source, ErrorCode.INSTRUMENT_ERROR, msg)
+            return self._create_error_packet(
+                packet,
+                ErrorCode.INSTRUMENT_ERROR,
+                msg,
+                details={"exception_type": type(e).__name__, "exception": str(e)},
+            )
 
-        return self._create_control_packet(
-            packet.source, Request.GET_PARAMETER, ValuePayload(value=parameter_ret).model_dump()
-        )
+        return self._create_control_packet(packet, Request.GET_PARAMETER, ValuePayload(value=value).model_dump())
 
     def _handle_parameter_write(self, packet: Packet) -> Packet:
         request_payload = SetParameterPayload.model_validate(packet.payload)
 
         if request_payload.instrument not in self.instantiated_instruments:
             return self._create_error_packet(
-                packet.source, ErrorCode.UNKNOWN_INSTRUMENT, f"Instrument '{request_payload.instrument}' not found."
+                packet, ErrorCode.UNKNOWN_INSTRUMENT, f"Instrument '{request_payload.instrument}' not found."
             )
         instrument = self.instantiated_instruments[request_payload.instrument]
 
         if request_payload.parameter not in instrument.parameters:
             return self._create_error_packet(
-                packet.source,
+                packet,
                 ErrorCode.UNKNOWN_PARAMETER,
                 f"Parameter '{request_payload.parameter}' not found in '{instrument.name}'",
             )
 
-        try:
-            setattr(instrument, request_payload.parameter, request_payload.value)
-            # TODO: Double check this exception type, I am not entirely sure this would work.
-        except AttributeError as e:
-            msg = f"Error setting parameter '{request_payload.parameter}' in '{instrument.name}'. Error: {e}"
-            return self._create_error_packet(packet.source, ErrorCode.INSTRUMENT_ERROR, msg)
+        _, write_adapter = self._parameter_types[request_payload.instrument][request_payload.parameter]
 
-        return self._create_control_packet(packet.source, Request.SET_PARAMETER, None)
+        try:
+            value = (
+                write_adapter.validate_python(request_payload.value)
+                if write_adapter is not None
+                else request_payload.value
+            )
+            setattr(instrument, request_payload.parameter, value)
+        except ValidationError as e:
+            msg = f"Invalid value for parameter '{request_payload.parameter}' in '{instrument.name}'. Error: {e}"
+            return self._create_error_packet(packet, ErrorCode.INVALID_ARGUMENTS, msg)
+        # Adding ruff exception due to not know what type of exceptions instruments can raise.
+        except Exception as e:  # noqa:BLE001
+            msg = f"Error setting parameter '{request_payload.parameter}' in '{instrument.name}'. Error: {e}"
+            return self._create_error_packet(
+                packet,
+                ErrorCode.INSTRUMENT_ERROR,
+                msg,
+                details={"exception_type": type(e).__name__, "exception": str(e)},
+            )
+
+        return self._create_control_packet(packet, Request.SET_PARAMETER, None)
 
     def _handle_info_control(self, packet: Packet) -> Packet:
         request_payload = GetInfoPayload.model_validate(packet.payload)
 
         if request_payload.instrument not in self.instantiated_instruments:
             return self._create_error_packet(
-                packet.source, ErrorCode.UNKNOWN_INSTRUMENT, f"Instrument '{request_payload.instrument}' not found."
+                packet, ErrorCode.UNKNOWN_INSTRUMENT, f"Instrument '{request_payload.instrument}' not found."
             )
         instrument = self.instantiated_instruments[request_payload.instrument]
 
-        return self._create_control_packet(
-            packet.source, Request.GET_INFO, ValuePayload(value=instrument.info).model_dump()
-        )
+        info_adapter = self._info_types[request_payload.instrument]
+
+        try:
+            value = info_adapter.dump_python(instrument.info, mode="json")
+        # Adding ruff exception due to not know what type of exceptions instruments can raise.
+        except Exception as e:  # noqa:BLE001
+            msg = f"Error reading the info of '{instrument.name}'. Error: {e}"
+            return self._create_error_packet(
+                packet,
+                ErrorCode.INSTRUMENT_ERROR,
+                msg,
+                details={"exception_type": type(e).__name__, "exception": str(e)},
+            )
+
+        return self._create_control_packet(packet, Request.GET_INFO, ValuePayload(value=value).model_dump())
 
     def _handle_instrument_control(self, packet: Packet) -> Packet:
         match packet.request:
@@ -409,23 +676,32 @@ class InstrumentProvider:
 
             case _:
                 return self._create_error_packet(
-                    packet.source, ErrorCode.UNSUPPORTED_REQUEST, f"Unsupported request '{packet.request}'"
+                    packet, ErrorCode.UNSUPPORTED_REQUEST, f"Unsupported request '{packet.request}'"
                 )
 
-    def _create_error_packet(self, destination: str, code: ErrorCode, error_msg: str) -> Packet:
+    def _create_error_packet(
+        self, packet: Packet | None, code: ErrorCode, error_msg: str, details: dict[str, Any] | None = None
+    ) -> Packet:
+        """Create an error reply for a request Packet, echoing its id as reply_to.
+
+        Without a request Packet (input that could not be decoded) the reply goes to the Router.
+        """
         return Packet(
             intent=PacketIntent.ERROR,
             request=Request.ERROR,
             source=self.name,
-            destination=destination,
-            payload=ErrorPayload(code=code, message=error_msg, origin=self.name).model_dump(),
+            destination=packet.source if packet is not None else self.router_name,
+            reply_to=packet.id if packet is not None else None,
+            payload=ErrorPayload(code=code, message=error_msg, origin=self.name, details=details or {}).model_dump(),
         )
 
-    def _create_control_packet(self, destination: str, request: Request, payload: dict[str, Any] | None) -> Packet:
+    def _create_control_packet(self, packet: Packet, request: Request, payload: dict[str, Any] | None) -> Packet:
+        """Create a CONTROL reply for a request Packet, echoing its id as reply_to."""
         return Packet(
             intent=PacketIntent.CONTROL,
             request=request,
             source=self.name,
-            destination=destination,
+            destination=packet.source,
+            reply_to=packet.id,
             payload=payload,
         )

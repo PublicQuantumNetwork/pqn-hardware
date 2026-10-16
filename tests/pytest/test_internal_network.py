@@ -7,24 +7,42 @@ import logging
 import socket
 import threading
 import time
+from collections.abc import Generator
 from typing import Any
 
 import pytest
+import zmq
 
+from pqn_hardware.drivers.dummies import DummyInstrument
+from pqn_hardware.errors import InvalidInstrumentsConfigurationError
 from pqn_hardware.network.client import Client
 from pqn_hardware.network.client import ProxyInstrument
 from pqn_hardware.network.instrument_provider import InstrumentProvider
+from pqn_hardware.network.packet import CallOperationPayload
 from pqn_hardware.network.packet import DeviceSummary
+from pqn_hardware.network.packet import ErrorCode
+from pqn_hardware.network.packet import ErrorPayload
+from pqn_hardware.network.packet import GetDeviceStructurePayload
+from pqn_hardware.network.packet import GetInfoPayload
+from pqn_hardware.network.packet import GetParameterPayload
+from pqn_hardware.network.packet import NetworkElementClass
 from pqn_hardware.network.packet import Packet
 from pqn_hardware.network.packet import PacketIntent
 from pqn_hardware.network.packet import Request
+from pqn_hardware.network.packet import SetParameterPayload
+from pqn_hardware.network.packet import create_registration_packet
+from pqn_hardware.network.packet import decode
+from pqn_hardware.network.packet import encode
 from pqn_hardware.network.router import Router
 
 logger = logging.getLogger(__name__)
 
 ROUTER_NAME = "pqn_hardware-router"
 PROVIDER_NAME = "pqn_hardware-provider"
+RAW_PROVIDER_NAME = "pqn_hardware-raw-provider"
 HOST = "127.0.0.1"
+# Error replies must arrive well inside a Client's timeout; the socket timeout fails a missing reply fast.
+ERROR_TIMEOUT_MS = 2_000
 
 
 def _free_port() -> int:
@@ -76,6 +94,131 @@ def network_port() -> int:
 
 def _client(network_port: int) -> Client:
     return Client(host=HOST, port=network_port, router_name=ROUTER_NAME, timeout=10_000)
+
+
+class _RawClient:
+    """A REQ socket speaking the wire protocol directly.
+
+    The Client class raises PacketError on an ERROR reply before a test can read the ErrorPayload;
+    this socket returns the reply Packet itself.
+    """
+
+    def __init__(self, port: int, name: str) -> None:
+        self.name = name
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REQ)
+        self.socket.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+        self.socket.setsockopt_string(zmq.IDENTITY, name)
+        self.socket.connect(f"tcp://{HOST}:{port}")
+        self.ask(create_registration_packet(source=name, destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT))
+
+    def ask(self, packet: Packet) -> Packet:
+        """Send a Packet and return the reply Packet.
+
+        The short socket timeout is what makes every test using it assert a fast reply, not a timeout.
+        """
+        self.socket.send(encode(packet))
+        return decode(self.socket.recv())
+
+    def close(self) -> None:
+        self.socket.close()
+        self.context.term()
+
+
+@pytest.fixture
+def raw_client(network_port: int) -> Generator[_RawClient, Any, None]:
+    client = _RawClient(network_port, "raw-test-client")
+    yield client
+    client.close()
+
+
+class _RawRouter:
+    """A plain ZMQ ROUTER socket standing in for the Router.
+
+    It lets tests deliver Packets the real Router would never forward to a Provider: misaddressed
+    Packets, undecodable bytes and wrong frame counts.
+    """
+
+    def __init__(self, provider_name: str) -> None:
+        self.provider_name = provider_name
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.ROUTER)
+        self.socket.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+        self.port = _free_port()
+        self.socket.bind(f"tcp://{HOST}:{self.port}")
+
+        # A long beat period keeps registration Heartbeats from arriving between test messages.
+        provider = InstrumentProvider(
+            provider_name,
+            HOST,
+            self.port,
+            ROUTER_NAME,
+            beat_period=60_000,
+            dummy1={
+                "import": "pqn_hardware.drivers.dummies.DummyInstrument",
+                "desc": "Dummy instrument on the raw router",
+                "hw_address": "1234",
+            },
+        )
+        threading.Thread(target=provider.start, daemon=True).start()
+
+        # Answer the provider's registration Heartbeat with an acknowledgement.
+        self.provider_identity, reg_data = self.socket.recv_multipart()
+        registration = decode(reg_data)
+        assert registration.request == Request.REGISTER
+        assert registration.source == provider_name
+        self.socket.send_multipart(
+            [
+                self.provider_identity,
+                b"",
+                encode(
+                    Packet(
+                        intent=PacketIntent.REGISTRATION_ACK,
+                        request=Request.ACKNOWLEDGE,
+                        source=ROUTER_NAME,
+                        destination=provider_name,
+                    )
+                ),
+            ]
+        )
+
+    def ask(self, packet: Packet) -> Packet:
+        """Deliver a Packet to the Provider and return its reply Packet."""
+        self.socket.send_multipart([self.provider_identity, b"", encode(packet)])
+        _, data = self.socket.recv_multipart()
+        return decode(data)
+
+    def send_bytes(self, data: bytes, *extra: bytes) -> None:
+        """Deliver raw frames to the Provider, after the delimiter the Router sends."""
+        self.socket.send_multipart([self.provider_identity, b"", data, *extra])
+
+    def receive(self) -> Packet:
+        """Receive the Provider's reply Packet."""
+        _, data = self.socket.recv_multipart()
+        return decode(data)
+
+    def close(self) -> None:
+        self.socket.close()
+        self.context.term()
+
+
+@pytest.fixture(scope="module")
+def raw_router() -> Generator[_RawRouter, Any, None]:
+    harness = _RawRouter(RAW_PROVIDER_NAME)
+    yield harness
+    harness.close()
+
+
+def _assert_error_reply(reply: Packet, request: Packet, code: ErrorCode, origin: str) -> ErrorPayload:
+    """Assert a reply is an error reply with a code and Origin, echoing the request id."""
+    assert reply.intent == PacketIntent.ERROR
+    assert reply.request == Request.ERROR
+    assert reply.destination == request.source
+    assert reply.reply_to == request.id
+    payload = ErrorPayload.model_validate(reply.payload)
+    assert payload.code == code
+    assert payload.origin == origin
+    return payload
 
 
 def test_client_ping(network_port: int) -> None:
@@ -183,3 +326,388 @@ def test_proxy_instrument_get_info(network_port: int) -> None:
     # Order-safe under pytest-randomly: compare against a live read of the same parameters.
     assert info["param_str"] == proxy_instrument.param_str
     assert info["param_int"] == proxy_instrument.param_int
+
+
+def test_error_unknown_instrument(raw_client: _RawClient) -> None:
+    request = Packet(
+        intent=PacketIntent.DATA,
+        request=Request.GET_DEVICE_STRUCTURE,
+        source=raw_client.name,
+        destination=PROVIDER_NAME,
+        payload=GetDeviceStructurePayload(instrument="nonexistent").model_dump(),
+    )
+
+    reply = raw_client.ask(request)
+
+    _assert_error_reply(reply, request, ErrorCode.UNKNOWN_INSTRUMENT, PROVIDER_NAME)
+
+
+def test_error_unknown_operation(raw_client: _RawClient) -> None:
+    request = Packet(
+        intent=PacketIntent.CONTROL,
+        request=Request.CALL_OPERATION,
+        source=raw_client.name,
+        destination=PROVIDER_NAME,
+        payload=CallOperationPayload(instrument="dummy1", operation="nonexistent").model_dump(),
+    )
+
+    reply = raw_client.ask(request)
+
+    _assert_error_reply(reply, request, ErrorCode.UNKNOWN_OPERATION, PROVIDER_NAME)
+
+
+def test_error_unknown_parameter(raw_client: _RawClient) -> None:
+    request = Packet(
+        intent=PacketIntent.CONTROL,
+        request=Request.GET_PARAMETER,
+        source=raw_client.name,
+        destination=PROVIDER_NAME,
+        payload=GetParameterPayload(instrument="dummy1", parameter="nonexistent").model_dump(),
+    )
+
+    reply = raw_client.ask(request)
+
+    _assert_error_reply(reply, request, ErrorCode.UNKNOWN_PARAMETER, PROVIDER_NAME)
+
+
+def test_error_invalid_arguments_for_operation_kwargs(raw_client: _RawClient) -> None:
+    request = Packet(
+        intent=PacketIntent.CONTROL,
+        request=Request.CALL_OPERATION,
+        source=raw_client.name,
+        destination=PROVIDER_NAME,
+        payload=CallOperationPayload(
+            instrument="dummy1", operation="set_half_input_int", kwargs={"value": "not a number"}
+        ).model_dump(),
+    )
+
+    reply = raw_client.ask(request)
+
+    _assert_error_reply(reply, request, ErrorCode.INVALID_ARGUMENTS, PROVIDER_NAME)
+
+
+def test_error_invalid_arguments_for_parameter_value(raw_client: _RawClient) -> None:
+    request = Packet(
+        intent=PacketIntent.CONTROL,
+        request=Request.SET_PARAMETER,
+        source=raw_client.name,
+        destination=PROVIDER_NAME,
+        payload=SetParameterPayload(instrument="dummy1", parameter="param_int", value="not a number").model_dump(),
+    )
+
+    reply = raw_client.ask(request)
+
+    _assert_error_reply(reply, request, ErrorCode.INVALID_ARGUMENTS, PROVIDER_NAME)
+
+
+def test_error_instrument_error(raw_client: _RawClient) -> None:
+    request = Packet(
+        intent=PacketIntent.CONTROL,
+        request=Request.CALL_OPERATION,
+        source=raw_client.name,
+        destination=PROVIDER_NAME,
+        payload=CallOperationPayload(instrument="dummy1", operation="fail").model_dump(),
+    )
+
+    reply = raw_client.ask(request)
+
+    payload = _assert_error_reply(reply, request, ErrorCode.INSTRUMENT_ERROR, PROVIDER_NAME)
+    assert payload.details["exception_type"] == "RuntimeError"
+    assert "dummy instrument failure" in payload.details["exception"]
+
+
+def test_error_unsupported_request_for_unknown_data_verb(raw_client: _RawClient) -> None:
+    request = Packet(
+        intent=PacketIntent.DATA,
+        request=Request.GET_PROVIDERS,
+        source=raw_client.name,
+        destination=PROVIDER_NAME,
+    )
+
+    reply = raw_client.ask(request)
+
+    _assert_error_reply(reply, request, ErrorCode.UNSUPPORTED_REQUEST, PROVIDER_NAME)
+
+
+def test_error_malformed_packet_on_invalid_payload(raw_client: _RawClient) -> None:
+    # A GET_DEVICE_STRUCTURE Packet without its required payload.
+    request = Packet(
+        intent=PacketIntent.DATA,
+        request=Request.GET_DEVICE_STRUCTURE,
+        source=raw_client.name,
+        destination=PROVIDER_NAME,
+    )
+
+    reply = raw_client.ask(request)
+
+    _assert_error_reply(reply, request, ErrorCode.MALFORMED_PACKET, PROVIDER_NAME)
+
+
+def test_error_wrong_destination(raw_router: _RawRouter) -> None:
+    # The real Router never forwards a misaddressed Packet to a Provider, so this goes through a raw socket.
+    request = Packet(
+        intent=PacketIntent.DATA,
+        request=Request.GET_DEVICES,
+        source="some-client",
+        destination="another-provider",
+    )
+
+    reply = raw_router.ask(request)
+
+    _assert_error_reply(reply, request, ErrorCode.WRONG_DESTINATION, RAW_PROVIDER_NAME)
+
+    # The Provider keeps serving after replying to a misaddressed Packet.
+    follow_up = Packet(
+        intent=PacketIntent.DATA,
+        request=Request.GET_DEVICES,
+        source="some-client",
+        destination=RAW_PROVIDER_NAME,
+    )
+    follow_up_reply = raw_router.ask(follow_up)
+    assert follow_up_reply.reply_to == follow_up.id
+    assert "dummy1" in follow_up_reply.payload["devices"]
+
+
+def test_error_malformed_packet_on_undecodable_bytes(raw_router: _RawRouter) -> None:
+    # Bytes a pre-v2 pickle peer would send: not JSON at all, so there is no id to echo.
+    raw_router.send_bytes(b"\x80\x04\x95pickle-bytes")
+    reply = raw_router.receive()
+
+    assert reply.intent == PacketIntent.ERROR
+    assert reply.reply_to is None
+    assert reply.destination == ROUTER_NAME
+    payload = ErrorPayload.model_validate(reply.payload)
+    assert payload.code == ErrorCode.MALFORMED_PACKET
+    assert payload.origin == RAW_PROVIDER_NAME
+
+
+def test_error_malformed_packet_on_wrong_frame_count(raw_router: _RawRouter) -> None:
+    # One frame too many after the delimiter.
+    raw_router.send_bytes(b"{}", b"extra-frame")
+    reply = raw_router.receive()
+
+    assert reply.intent == PacketIntent.ERROR
+    payload = ErrorPayload.model_validate(reply.payload)
+    assert payload.code == ErrorCode.MALFORMED_PACKET
+    assert payload.origin == RAW_PROVIDER_NAME
+
+    # The Provider keeps serving after replying to bad input.
+    follow_up = Packet(
+        intent=PacketIntent.DATA,
+        request=Request.GET_DEVICES,
+        source="some-client",
+        destination=RAW_PROVIDER_NAME,
+    )
+    follow_up_reply = raw_router.ask(follow_up)
+    assert follow_up_reply.reply_to == follow_up.id
+    assert "dummy1" in follow_up_reply.payload["devices"]
+
+
+def test_reply_to_is_echoed_on_every_reply(raw_client: _RawClient) -> None:
+    # Uses dummy2 so the mutating requests do not depend on, or disturb, dummy1's state.
+    requests = [
+        Packet(intent=PacketIntent.PING, request=Request.PING, source=raw_client.name, destination=PROVIDER_NAME),
+        Packet(
+            intent=PacketIntent.DATA, request=Request.GET_DEVICES, source=raw_client.name, destination=PROVIDER_NAME
+        ),
+        Packet(
+            intent=PacketIntent.DATA,
+            request=Request.GET_DEVICE_STRUCTURE,
+            source=raw_client.name,
+            destination=PROVIDER_NAME,
+            payload=GetDeviceStructurePayload(instrument="dummy2").model_dump(),
+        ),
+        Packet(
+            intent=PacketIntent.CONTROL,
+            request=Request.CALL_OPERATION,
+            source=raw_client.name,
+            destination=PROVIDER_NAME,
+            payload=CallOperationPayload(instrument="dummy2", operation="double_int").model_dump(),
+        ),
+        Packet(
+            intent=PacketIntent.CONTROL,
+            request=Request.GET_PARAMETER,
+            source=raw_client.name,
+            destination=PROVIDER_NAME,
+            payload=GetParameterPayload(instrument="dummy2", parameter="param_int").model_dump(),
+        ),
+        Packet(
+            intent=PacketIntent.CONTROL,
+            request=Request.SET_PARAMETER,
+            source=raw_client.name,
+            destination=PROVIDER_NAME,
+            payload=SetParameterPayload(instrument="dummy2", parameter="param_int", value=7).model_dump(),
+        ),
+        Packet(
+            intent=PacketIntent.CONTROL,
+            request=Request.GET_INFO,
+            source=raw_client.name,
+            destination=PROVIDER_NAME,
+            payload=GetInfoPayload(instrument="dummy2").model_dump(),
+        ),
+    ]
+
+    for request in requests:
+        reply = raw_client.ask(request)
+        assert reply.reply_to == request.id, f"Request {request.request} did not echo its id as reply_to"
+        assert reply.destination == raw_client.name
+
+
+def test_device_structure_has_json_schemas_and_type_paths(raw_client: _RawClient) -> None:
+    request = Packet(
+        intent=PacketIntent.DATA,
+        request=Request.GET_DEVICE_STRUCTURE,
+        source=raw_client.name,
+        destination=PROVIDER_NAME,
+        payload=GetDeviceStructurePayload(instrument="dummy1").model_dump(),
+    )
+
+    reply = raw_client.ask(request)
+
+    structure = reply.payload
+    assert structure["name"] == "dummy1"
+    assert structure["desc"] == "Dummy instrument1 for testing purposes"
+    assert structure["hw_address"] == "1234"
+    assert structure["type"] == "pqn_hardware.drivers.dummies.DummyInstrument"
+
+    # The info carries the JSON Schema of its type and, not being JSON-native, its Python type path.
+    assert structure["info"]["type"] == "pqn_hardware.drivers.dummies.DummyInfo"
+    assert structure["info"]["schema"]["type"] == "object"
+    assert "param_int" in structure["info"]["schema"]["properties"]
+
+    operations = structure["operations"]
+    assert set(operations) == {
+        "double_int",
+        "lowercase_str",
+        "uppercase_str",
+        "toggle_bool",
+        "set_half_input_int",
+        "fail",
+    }
+    # Keyword arguments validate against a JSON Schema that forbids unknown arguments.
+    args_schema = operations["set_half_input_int"]["args_schema"]
+    assert args_schema["type"] == "object"
+    assert args_schema["additionalProperties"] is False
+    assert args_schema["properties"]["value"] == {"title": "Value", "type": "integer"}
+    assert args_schema["required"] == ["value"]
+    # A JSON-native return type has a schema and no type path.
+    assert operations["set_half_input_int"]["returns_schema"] == {"type": "integer"}
+    assert operations["set_half_input_int"]["returns_type"] is None
+    assert operations["double_int"]["args_schema"]["properties"] == {}
+    assert operations["fail"]["returns_schema"] == {"type": "null"}
+
+    parameters = structure["parameters"]
+    assert set(parameters) == {"param_int", "param_str", "param_bool"}
+    assert parameters["param_int"]["schema"] == {"type": "integer"}
+    assert parameters["param_int"]["type"] is None
+    assert parameters["param_int"]["writable"] is True
+    assert parameters["param_str"]["schema"] == {"type": "string"}
+    assert parameters["param_bool"]["schema"] == {"type": "boolean"}
+
+
+def test_return_values_are_serialized_via_the_return_annotation(raw_client: _RawClient) -> None:
+    # Uses dummy2 and sets its state first, so the test does not depend on other tests' order.
+    input_value = 30
+    half_input_value = input_value // 2
+    call = Packet(
+        intent=PacketIntent.CONTROL,
+        request=Request.CALL_OPERATION,
+        source=raw_client.name,
+        destination=PROVIDER_NAME,
+        payload=CallOperationPayload(
+            instrument="dummy2", operation="set_half_input_int", kwargs={"value": input_value}
+        ).model_dump(),
+    )
+    call_reply = raw_client.ask(call)
+    assert call_reply.payload == {"value": half_input_value}
+
+    read = Packet(
+        intent=PacketIntent.CONTROL,
+        request=Request.GET_PARAMETER,
+        source=raw_client.name,
+        destination=PROVIDER_NAME,
+        payload=GetParameterPayload(instrument="dummy2", parameter="param_int").model_dump(),
+    )
+    read_reply = raw_client.ask(read)
+    assert read_reply.payload == {"value": half_input_value}
+
+    # The DummyInfo dataclass is serialized through its return annotation, as a JSON object.
+    info = Packet(
+        intent=PacketIntent.CONTROL,
+        request=Request.GET_INFO,
+        source=raw_client.name,
+        destination=PROVIDER_NAME,
+        payload=GetInfoPayload(instrument="dummy2").model_dump(),
+    )
+    info_reply = raw_client.ask(info)
+    info_value = info_reply.payload["value"]
+    assert info_value["name"] == "dummy2"
+    assert info_value["param_int"] == half_input_value
+    # Order-safe under pytest-randomly: compare against a live read of the same parameter.
+    param_str_read = Packet(
+        intent=PacketIntent.CONTROL,
+        request=Request.GET_PARAMETER,
+        source=raw_client.name,
+        destination=PROVIDER_NAME,
+        payload=GetParameterPayload(instrument="dummy2", parameter="param_str").model_dump(),
+    )
+    assert info_value["param_str"] == raw_client.ask(param_str_read).payload["value"]
+
+
+class _Unschemaable:
+    """A type pydantic cannot turn into a JSON Schema."""
+
+
+class _BadOperationInstrument(DummyInstrument):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.operations["bad_operation"] = self.bad_operation
+
+    def bad_operation(self, value: _Unschemaable) -> None: ...
+
+
+class _BadParameterInstrument(DummyInstrument):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.parameters.add("bad_parameter")
+
+    @property
+    def bad_parameter(self) -> _Unschemaable: ...
+
+    @bad_parameter.setter
+    def bad_parameter(self, value: _Unschemaable) -> None: ...
+
+
+def test_startup_fails_when_an_operation_type_hint_cannot_produce_a_json_schema() -> None:
+    provider = InstrumentProvider(
+        "bad-hints-provider",
+        HOST,
+        _free_port(),
+        ROUTER_NAME,
+        bad={
+            "import": "tests.pytest.test_internal_network._BadOperationInstrument",
+            "desc": "Instrument with an unschemaable operation",
+            "hw_address": "1234",
+        },
+    )
+
+    # The configuration error is raised at startup, before the provider talks to any Router.
+    with pytest.raises(InvalidInstrumentsConfigurationError, match="bad_operation"):
+        provider.start()
+
+
+def test_startup_fails_when_a_parameter_type_hint_cannot_produce_a_json_schema() -> None:
+    provider = InstrumentProvider(
+        "bad-hints-provider",
+        HOST,
+        _free_port(),
+        ROUTER_NAME,
+        bad={
+            "import": "tests.pytest.test_internal_network._BadParameterInstrument",
+            "desc": "Instrument with an unschemaable parameter",
+            "hw_address": "1234",
+        },
+    )
+
+    with pytest.raises(InvalidInstrumentsConfigurationError, match="bad_parameter"):
+        provider.start()

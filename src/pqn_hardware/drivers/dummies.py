@@ -29,6 +29,7 @@ class DummyInstrument(Instrument):
             "uppercase_str": self.uppercase_str,
             "toggle_bool": self.toggle_bool,
             "set_half_input_int": self.set_half_input_int,
+            "fail": self.fail,
         }
 
     @property
@@ -87,6 +88,12 @@ class DummyInstrument(Instrument):
     def set_half_input_int(self, value: int) -> int:
         self._param_int = value // 2
         return self._param_int
+
+    @log_operation
+    def fail(self) -> None:
+        """Raise unconditionally, so tests can exercise INSTRUMENT_ERROR replies."""
+        msg = "dummy instrument failure"
+        raise RuntimeError(msg)
 
     @log_operation
     def lowercase_str(self) -> str:
