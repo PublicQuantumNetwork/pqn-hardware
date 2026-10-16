@@ -441,6 +441,147 @@ def test_error_reply_raises_packet_error_with_the_error_payload(network_port: in
     assert error.message
 
 
+def test_mismatched_reply_to_is_dropped_and_ask_raises_timeout(caplog: pytest.LogCaptureFixture) -> None:
+    # A reply that passes the socket's request-id filter but answers no request of ours: only a
+    # peer that breaks the protocol sends one, so this harness stands in for the Router.
+    port = _free_port()
+    context = zmq.Context()
+    server = context.socket(zmq.ROUTER)
+    server.setsockopt(zmq.ROUTER_HANDOVER, 1)
+    server.bind(f"tcp://{HOST}:{port}")
+
+    def serve() -> None:
+        # Registration: echo the request id, with the captured request-id frame.
+        identity, frame, _, data = server.recv_multipart()
+        registration = decode(data)
+        server.send_multipart(
+            [
+                identity,
+                frame,
+                b"",
+                encode(
+                    Packet(
+                        intent=PacketIntent.REGISTRATION_ACK,
+                        request=Request.ACKNOWLEDGE,
+                        source=ROUTER_NAME,
+                        destination=registration.source,
+                        reply_to=registration.id,
+                    )
+                ),
+            ]
+        )
+
+        # A reply with the right request-id frame but a reply_to that matches no request.
+        identity, frame, _, data = server.recv_multipart()
+        request = decode(data)
+        server.send_multipart(
+            [
+                identity,
+                frame,
+                b"",
+                encode(
+                    Packet(
+                        intent=PacketIntent.PING,
+                        request=Request.PONG,
+                        source=PROVIDER_NAME,
+                        destination=request.source,
+                        reply_to="not-the-request-id",
+                    )
+                ),
+            ]
+        )
+
+        # The next request gets a reply that answers it.
+        identity, frame, _, data = server.recv_multipart()
+        request = decode(data)
+        server.send_multipart(
+            [
+                identity,
+                frame,
+                b"",
+                encode(
+                    Packet(
+                        intent=PacketIntent.PING,
+                        request=Request.PONG,
+                        source=PROVIDER_NAME,
+                        destination=request.source,
+                        reply_to=request.id,
+                    )
+                ),
+            ]
+        )
+
+    threading.Thread(target=serve, daemon=True).start()
+
+    client = Client(host=HOST, port=port, router_name=ROUTER_NAME, timeout=1000)
+    try:
+        with (
+            caplog.at_level(logging.WARNING, logger="pqn_hardware.network.client"),
+            pytest.raises(TimeoutError),
+        ):
+            client.ping(PROVIDER_NAME)
+
+        # The mismatched reply is dropped with a warning naming the ids.
+        assert any("not-the-request-id" in record.message for record in caplog.records)
+
+        # The Client survives the dropped reply: the next request succeeds on the same socket.
+        reply = client.ping(PROVIDER_NAME)
+        assert reply is not None
+        assert reply.request == Request.PONG
+        assert reply.reply_to is not None
+    finally:
+        # Close the socket while the Client is alive, so a garbage-collected context can never
+        # block another thread's garbage collection in zmq Context.term().
+        client.disconnect()
+
+    server.close()
+    context.term()
+
+
+def test_router_sends_a_stale_reply_without_the_request_id_frame(network_port: int) -> None:
+    # A reply that no longer answers the Client's latest request goes out without the
+    # request-id frame, so the Client's REQ socket drops it; the reply that does answer
+    # it is the only one the socket accepts.
+    context = zmq.Context()
+    socket = context.socket(zmq.REQ)
+    socket.setsockopt(zmq.REQ_RELAXED, 1)
+    socket.setsockopt(zmq.REQ_CORRELATE, 1)
+    socket.setsockopt(zmq.RCVTIMEO, 5000)
+    socket.setsockopt_string(zmq.IDENTITY, "correlated-test-client")
+    socket.connect(f"tcp://{HOST}:{network_port}")
+
+    registration = create_registration_packet(
+        source="correlated-test-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
+    )
+    socket.send(encode(registration))
+    ack = decode(socket.recv())
+    assert ack.intent == PacketIntent.REGISTRATION_ACK
+    assert ack.reply_to == registration.id
+
+    # A slow request the client does not wait for, then a second request while it runs.
+    toggle = Packet(
+        intent=PacketIntent.CONTROL,
+        request=Request.CALL_OPERATION,
+        source="correlated-test-client",
+        destination=PROVIDER_NAME,
+        payload=CallOperationPayload(instrument="dummy2", operation="toggle_bool").model_dump(),
+    )
+    socket.send(encode(toggle))
+
+    ping = Packet(
+        intent=PacketIntent.PING, request=Request.PING, source="correlated-test-client", destination=PROVIDER_NAME
+    )
+    socket.send(encode(ping))
+
+    # The one reply the socket accepts answers the second request.
+    reply = decode(socket.recv())
+    assert reply.request == Request.PONG
+    assert reply.reply_to == ping.id
+
+    socket.close()
+    context.term()
+
+
 def test_dataclass_return_value_is_rebuilt_as_its_class(measuring_network_port: int) -> None:
     client = Client(host=HOST, port=measuring_network_port, router_name=ROUTER_NAME, timeout=10_000)
 
@@ -476,6 +617,67 @@ def test_dataclass_argument_is_dumped_to_json(measuring_network_port: int) -> No
     # rebuilt dataclass carries the counts attribute the Operation reads.
     counts = 5
     assert proxy_instrument.record_measurement(_Measurement(counts=counts)) == counts
+
+
+def test_broken_type_paths_fall_back_to_the_plain_data(
+    measuring_network_port: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    client = Client(host=HOST, port=measuring_network_port, router_name=ROUTER_NAME, timeout=10_000)
+
+    proxy_instrument = client.get_device(MEASURING_PROVIDER_NAME, "measuring1")
+
+    with caplog.at_level(logging.WARNING, logger="pqn_hardware.network.client"):
+        # The module imports but the name is missing: AttributeError.
+        proxy_instrument.client.device_structure["operations"]["measure"]["returns_type"] = (
+            "pqn_hardware.drivers.dummies.NoSuchType"
+        )
+        assert proxy_instrument.measure() == {"counts": 3, "label": "counts"}
+
+        # The path imports but the value fails validation against it: ValidationError.
+        proxy_instrument.client.device_structure["operations"]["labels"]["returns_type"] = (
+            "tests.pytest.test_internal_network._Measurement"
+        )
+        assert proxy_instrument.labels() == ["a", "b"]
+
+        # A path without a dot: ValueError.
+        proxy_instrument.client.device_structure["operations"]["measure"]["returns_type"] = "NoSuchType"
+        assert proxy_instrument.measure() == {"counts": 3, "label": "counts"}
+
+    warnings = [record.message for record in caplog.records]
+    fallbacks = 3
+    assert len(warnings) == fallbacks
+    assert all("returning the plain JSON data instead" in warning for warning in warnings)
+
+
+def test_dataclass_parameter_round_trips_through_the_proxy(
+    measuring_network_port: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    client = Client(host=HOST, port=measuring_network_port, router_name=ROUTER_NAME, timeout=10_000)
+
+    proxy_instrument = client.get_device(MEASURING_PROVIDER_NAME, "measuring1")
+
+    with caplog.at_level(logging.WARNING, logger="pqn_hardware.network.client"):
+        # Writing an instance dumps it to JSON; reading rebuilds it as the same class.
+        written = _Measurement(counts=7)
+        proxy_instrument.measurement_param = written
+        read_back = proxy_instrument.measurement_param
+
+    assert isinstance(read_back, _Measurement)
+    assert read_back == written
+    # Neither the write nor the read logs a rebuild warning: a SET reply carries no payload,
+    # and the read rebuilds without a fallback.
+    assert caplog.records == []
+
+
+def test_proxy_instrument_binds_two_positional_arguments_in_order(measuring_network_port: int) -> None:
+    client = Client(host=HOST, port=measuring_network_port, router_name=ROUTER_NAME, timeout=10_000)
+
+    proxy_instrument = client.get_device(MEASURING_PROVIDER_NAME, "measuring1")
+
+    # Each positional argument lands on its own name from the Device structure.
+    first = 4
+    second = 2
+    assert proxy_instrument.add(first, second) == first * 10 + second
 
 
 def test_error_unknown_instrument(raw_client: _RawClient) -> None:
@@ -1110,6 +1312,17 @@ class _MeasuringInstrument(DummyInstrument):
         self.operations["measure"] = self.measure
         self.operations["labels"] = self.labels
         self.operations["record_measurement"] = self.record_measurement
+        self.operations["add"] = self.add
+        self.parameters.add("measurement_param")
+        self._measurement_param = _Measurement(counts=0)
+
+    @property
+    def measurement_param(self) -> _Measurement:
+        return self._measurement_param
+
+    @measurement_param.setter
+    def measurement_param(self, value: _Measurement) -> None:
+        self._measurement_param = value
 
     def measure(self) -> _Measurement:
         return _Measurement(counts=3)
@@ -1120,6 +1333,10 @@ class _MeasuringInstrument(DummyInstrument):
     def record_measurement(self, measurement: _Measurement) -> int:
         """Take a dataclass argument; only a rebuilt dataclass has the counts attribute."""
         return measurement.counts
+
+    def add(self, first: int, second: int) -> int:
+        """Take two arguments, so a test can check that each lands on the right name."""
+        return first * 10 + second
 
 
 @dataclass(frozen=True, slots=True)

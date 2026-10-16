@@ -54,7 +54,9 @@ def _rebuild_value(value: Any, type_path: str | None) -> Any:
         module_name, _, type_name = type_path.rpartition(".")
         type_ = getattr(importlib.import_module(module_name), type_name)
         return TypeAdapter(type_).validate_python(value)
-    except (ImportError, AttributeError, ValidationError) as e:
+    # ValueError: a path without a dot makes import_module raise it; any import failure falls
+    # back to the plain JSON data (ADR-0002).
+    except (ImportError, AttributeError, ValueError, ValidationError) as e:
         logger.warning(
             "Could not rebuild the value as %s; returning the plain JSON data instead. Error: %s", type_path, e
         )
@@ -152,16 +154,19 @@ class ClientBase:
         self.socket.send(encode(packet))
         try:
             ret = decode(self.socket.recv())
-            while ret.reply_to != packet.id:
-                # A reply that does not answer this request is dropped, so it is never returned
-                # as the answer to the next request.
-                logger.warning(
-                    "Dropping a reply: its reply_to %s does not match the request id %s.", ret.reply_to, packet.id
-                )
-                ret = decode(self.socket.recv())
         except zmq.error.Again as e:
             logger.exception("Timeout occurred.")
             raise TimeoutError from e
+
+        if ret.reply_to != packet.id:
+            # A reply that does not answer this request is dropped, so it is never returned as
+            # the answer to the next request. A REQ socket cannot receive a
+            # second reply, so the request stays unanswered, exactly as if no reply had come
+            # and without re-sending it: an Operation must never run twice.
+            logger.warning(
+                "Dropping a reply: its reply_to %s does not match the request id %s.", ret.reply_to, packet.id
+            )
+            raise TimeoutError
 
         logger.debug("Response received.")
         logger.debug("Response: %s", str(ret))
@@ -278,6 +283,9 @@ class InstrumentClient(ClientBase):
 
         response = self.ask(packet)
 
+        if values:
+            # A SET reply carries no payload, so there is no value to rebuild.
+            return self._response_value(response)
         return _rebuild_value(self._response_value(response), self._parameter_type(parameter))
 
     def _parameter_type(self, parameter: str) -> str | None:
