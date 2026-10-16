@@ -130,14 +130,35 @@ def test_packet_round_trip(packet: Packet) -> None:
     assert decode(encode(packet)) == packet
 
 
-def test_missing_version_fails_decode() -> None:
-    """A missing version on the wire fails validation; the default only applies to construction."""
+def _without_version(changes: dict[str, Any]) -> bytes:
+    """Encode a wire envelope without its version field, applying changes to the remaining fields."""
     packet = Packet(intent=PacketIntent.DATA, request=Request.GET_DEVICES, source="source1", destination="dest1")
     wire = json.loads(encode(packet))
     del wire["version"]
+    return json.dumps({**wire, **changes}).encode("utf-8")
 
+
+@pytest.mark.parametrize(
+    "wire",
+    [
+        _without_version({}),
+        _without_version({"payload": {"version": 7}}),
+        _without_version({"source": "version"}),
+        _without_version({"version": None}),
+    ],
+    ids=[
+        "no-version-anywhere",
+        "version-only-in-the-payload",
+        "version-only-as-a-string-value",
+        "explicit-null-version",
+    ],
+)
+def test_missing_version_fails_decode(wire: bytes) -> None:
+    """A missing version on the wire fails validation; the default only applies to construction."""
+    # The version must be the envelope's own field: a "version" inside the Payload, or only as
+    # a string value, is not a version, and neither is an explicit null.
     with pytest.raises(ValidationError, match="version"):
-        decode(json.dumps(wire).encode("utf-8"))
+        decode(wire)
 
 
 def test_enums_serialize_by_name() -> None:

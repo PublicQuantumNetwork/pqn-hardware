@@ -950,6 +950,70 @@ def test_a_non_utf8_identity_client_receives_the_routers_own_replies(network_por
         context.term()
 
 
+def test_router_error_replies_answer_the_identity_frame_not_the_source(network_port: int) -> None:
+    # Every Router error reply answers the identity frame the message arrived on, never the
+    # Packet's source: a peer whose identity differs from its source still gets every reply.
+    # The identity is deliberately not UTF-8 text, and no Packet names it as source, so any
+    # reply addressed to the source instead reaches no peer at all.
+    context = zmq.Context()
+    socket = context.socket(zmq.REQ)
+    socket.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+    socket.setsockopt(zmq.IDENTITY, b"\x00\xff\xfe\xfd")
+    socket.connect(f"tcp://{HOST}:{network_port}")
+
+    try:
+        # An invalid REGISTER Payload: the MALFORMED_PACKET reply arrives on this socket.
+        bad_register = Packet(
+            intent=PacketIntent.REGISTRATION,
+            request=Request.REGISTER,
+            source="spoofed-source",
+            destination=ROUTER_NAME,
+            payload={"kind": "NOT_A_KIND"},
+        )
+        socket.send(encode(bad_register))
+        reply = decode(socket.recv())
+
+        assert reply.intent == PacketIntent.ERROR
+        assert reply.reply_to == bad_register.id
+        payload = ErrorPayload.model_validate(reply.payload)
+        assert payload.code == ErrorCode.MALFORMED_PACKET
+        assert payload.origin == ROUTER_NAME
+
+        # A REGISTER addressed to another Router: its error reply arrives on this socket too.
+        wrong_router = create_registration_packet(
+            source="spoofed-source", destination="another-router", kind=NetworkElementClass.CLIENT
+        )
+        socket.send(encode(wrong_router))
+        reply = decode(socket.recv())
+
+        assert reply.intent == PacketIntent.ERROR
+        assert reply.reply_to == wrong_router.id
+        payload = ErrorPayload.model_validate(reply.payload)
+        assert payload.code == ErrorCode.MALFORMED_PACKET
+        assert payload.origin == ROUTER_NAME
+
+        # A wrong-version Packet: its UNSUPPORTED_VERSION reply arrives on this socket too.
+        ping = Packet(
+            intent=PacketIntent.PING, request=Request.PING, source="spoofed-source", destination=PROVIDER_NAME
+        )
+        wire = json.loads(encode(ping))
+        wire["version"] = 3
+        socket.send(json.dumps(wire).encode("utf-8"))
+        reply = decode(socket.recv())
+
+        assert reply.intent == PacketIntent.ERROR
+        assert reply.reply_to == ping.id
+        payload = ErrorPayload.model_validate(reply.payload)
+        assert payload.code == ErrorCode.UNSUPPORTED_VERSION
+        assert payload.origin == ROUTER_NAME
+        assert payload.details == {"expected": PROTOCOL_VERSION, "received": 3}
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        socket.close()
+        context.term()
+
+
 def test_wrong_version_packets_are_refused_never_handled(network_port: int) -> None:
     # A wrong-version Packet is refused and never handled: no second reply follows the
     # UNSUPPORTED_VERSION error, the Provider never receives the Packet, and the sender is
@@ -1029,11 +1093,13 @@ def test_wrong_version_packets_are_refused_never_handled(network_port: int) -> N
         context.term()
 
 
-@pytest.mark.parametrize("wire", [b"[1, 2, 3]", b'{"id": 42}'], ids=["json-array", "id-not-a-string"])
+@pytest.mark.parametrize(
+    "wire", [b"[1, 2, 3]", b'{"id": 42}', b'"abc"'], ids=["json-array", "id-not-a-string", "json-string"]
+)
 def test_json_that_is_not_a_usable_envelope_gets_malformed_packet(network_port: int, wire: bytes) -> None:
-    # Valid JSON that is not a usable envelope: a JSON array, or a JSON object whose id is
-    # not a string. There is no readable id, so the error reply carries a null reply_to,
-    # and a follow-up request on the same socket is still answered.
+    # Valid JSON that is not a usable envelope: a JSON array, a JSON object whose id is not
+    # a string, or a bare JSON string. There is no readable id, so the error reply carries a
+    # null reply_to, and a follow-up request on the same socket is still answered.
     context = zmq.Context()
     socket = context.socket(zmq.REQ)
     socket.setsockopt(zmq.REQ_RELAXED, 1)
