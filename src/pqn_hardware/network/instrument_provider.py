@@ -39,8 +39,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Types JSON represents natively; every other type is published with its Python import path (ADR-0002).
-_JSON_NATIVE_TYPES = frozenset({type(None), bool, int, float, str})
+# Types JSON represents natively, including the bare list and dict containers; every other type
+# is published with its Python import path (ADR-0002).
+_JSON_NATIVE_TYPES = frozenset({type(None), bool, int, float, str, list, dict})
 
 
 def _type_path(annotation: Any) -> str | None:
@@ -58,7 +59,8 @@ def _annotated(annotation: Any) -> Any:
 def _arguments_model(operation: Callable[..., Any]) -> type[BaseModel]:
     """Build a model of an Operation's keyword arguments from its type hints.
 
-    This is the same arguments model pydantic's validate_call builds internally for the callable.
+    The model has one field per named parameter, with its default; positional variadic and
+    keyword-variadic parameters carry no type hints and are skipped, and unknown keywords are rejected.
     """
     fields: dict[str, Any] = {}
     for name, parameter in inspect.signature(operation, eval_str=True).parameters.items():
@@ -241,13 +243,13 @@ class InstrumentProvider:
         operations: dict[str, dict[str, Any]] = {}
         operation_types: dict[str, tuple[type[BaseModel], TypeAdapter[Any]]] = {}
         for op_name, operation in instrument.operations.items():
-            returns_annotation = _return_annotation(operation)
             try:
+                returns_annotation = _return_annotation(operation)
                 arguments_model = _arguments_model(operation)
                 returns_adapter = TypeAdapter(returns_annotation)
                 args_schema = arguments_model.model_json_schema()
                 returns_schema = returns_adapter.json_schema()
-            except PydanticUserError as e:
+            except (NameError, PydanticUserError) as e:
                 msg = (
                     f"Type hints of operation '{op_name}' in instrument '{ins_name}' cannot produce a JSON Schema: {e}"
                 )
@@ -262,12 +264,12 @@ class InstrumentProvider:
         parameters: dict[str, dict[str, Any]] = {}
         parameter_types: dict[str, tuple[TypeAdapter[Any], TypeAdapter[Any] | None]] = {}
         for param_name in instrument.parameters:
-            read_annotation, write_annotation, writable = _parameter_annotations(type(instrument), param_name)
             try:
+                read_annotation, write_annotation, writable = _parameter_annotations(type(instrument), param_name)
                 read_adapter = TypeAdapter(read_annotation)
                 write_adapter = TypeAdapter(write_annotation) if write_annotation is not None else None
                 schema = read_adapter.json_schema()
-            except PydanticUserError as e:
+            except (NameError, PydanticUserError) as e:
                 msg = f"Type hints of parameter '{param_name}' in instrument '{ins_name}' cannot produce a JSON Schema: {e}"
                 raise InvalidInstrumentsConfigurationError(msg) from e
             parameters[param_name] = {
@@ -277,11 +279,11 @@ class InstrumentProvider:
             }
             parameter_types[param_name] = (read_adapter, write_adapter)
 
-        info_annotation = _info_annotation(type(instrument))
         try:
+            info_annotation = _info_annotation(type(instrument))
             info_adapter = TypeAdapter(info_annotation)
             info_schema = info_adapter.json_schema()
-        except PydanticUserError as e:
+        except (NameError, PydanticUserError) as e:
             msg = f"The info type hint of instrument '{ins_name}' cannot produce a JSON Schema: {e}"
             raise InvalidInstrumentsConfigurationError(msg) from e
 
@@ -363,6 +365,11 @@ class InstrumentProvider:
 
             case PacketIntent.CONTROL:
                 return self._handle_instrument_control(packet)
+
+            case PacketIntent.ERROR:
+                # An ERROR Packet is itself a reply, never answered, so errors cannot bounce forever.
+                logger.warning("Received an ERROR Packet, which the Provider never asked for: %s", packet)
+                return None
 
             case _:
                 return self._create_error_packet(

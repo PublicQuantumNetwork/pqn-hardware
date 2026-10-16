@@ -8,6 +8,7 @@ import socket
 import threading
 import time
 from collections.abc import Generator
+from dataclasses import dataclass
 from typing import Any
 
 import pytest
@@ -28,6 +29,7 @@ from pqn_hardware.network.packet import GetParameterPayload
 from pqn_hardware.network.packet import NetworkElementClass
 from pqn_hardware.network.packet import Packet
 from pqn_hardware.network.packet import PacketIntent
+from pqn_hardware.network.packet import RegisterPayload
 from pqn_hardware.network.packet import Request
 from pqn_hardware.network.packet import SetParameterPayload
 from pqn_hardware.network.packet import create_registration_packet
@@ -158,6 +160,11 @@ class _RawRouter:
                 "import": "pqn_hardware.drivers.dummies.DummyInstrument",
                 "desc": "Dummy instrument on the raw router",
                 "hw_address": "1234",
+            },
+            measuring1={
+                "import": "tests.pytest.test_internal_network._MeasuringInstrument",
+                "desc": "Instrument whose operations return dataclasses and lists",
+                "hw_address": "5678",
             },
         )
         threading.Thread(target=provider.start, daemon=True).start()
@@ -429,6 +436,62 @@ def test_error_unsupported_request_for_unknown_data_verb(raw_client: _RawClient)
     _assert_error_reply(reply, request, ErrorCode.UNSUPPORTED_REQUEST, PROVIDER_NAME)
 
 
+def test_error_unsupported_request_for_unknown_control_verb(raw_client: _RawClient) -> None:
+    request = Packet(
+        intent=PacketIntent.CONTROL,
+        request=Request.GET_DEVICES,
+        source=raw_client.name,
+        destination=PROVIDER_NAME,
+    )
+
+    reply = raw_client.ask(request)
+
+    _assert_error_reply(reply, request, ErrorCode.UNSUPPORTED_REQUEST, PROVIDER_NAME)
+
+
+def test_registration_intent_packet_gets_unsupported_request(raw_router: _RawRouter) -> None:
+    # A REGISTRATION Packet the Provider never handles; through the raw router, since the real Router
+    # answers REGISTRATION Packets itself.
+    request = Packet(
+        intent=PacketIntent.REGISTRATION,
+        request=Request.REGISTER,
+        source="some-client",
+        destination=RAW_PROVIDER_NAME,
+        payload=RegisterPayload(kind=NetworkElementClass.CLIENT).model_dump(),
+    )
+
+    reply = raw_router.ask(request)
+
+    _assert_error_reply(reply, request, ErrorCode.UNSUPPORTED_REQUEST, RAW_PROVIDER_NAME)
+
+
+def test_error_intent_packet_gets_no_reply(raw_router: _RawRouter) -> None:
+    # An ERROR Packet is itself a reply and is never answered, so errors cannot bounce forever.
+    request = Packet(
+        intent=PacketIntent.ERROR,
+        request=Request.ERROR,
+        source="some-client",
+        destination=RAW_PROVIDER_NAME,
+        payload=ErrorPayload(
+            code=ErrorCode.INSTRUMENT_ERROR, message="an error the Provider never asked for", origin="some-client"
+        ).model_dump(),
+    )
+
+    with pytest.raises(zmq.error.Again):
+        raw_router.ask(request)
+
+    # The Provider keeps serving after ignoring the ERROR Packet.
+    follow_up = Packet(
+        intent=PacketIntent.DATA,
+        request=Request.GET_DEVICES,
+        source="some-client",
+        destination=RAW_PROVIDER_NAME,
+    )
+    follow_up_reply = raw_router.ask(follow_up)
+    assert follow_up_reply.reply_to == follow_up.id
+    assert "dummy1" in follow_up_reply.payload["devices"]
+
+
 def test_error_malformed_packet_on_invalid_payload(raw_client: _RawClient) -> None:
     # A GET_DEVICE_STRUCTURE Packet without its required payload.
     request = Packet(
@@ -605,6 +668,41 @@ def test_device_structure_has_json_schemas_and_type_paths(raw_client: _RawClient
     assert parameters["param_bool"]["schema"] == {"type": "boolean"}
 
 
+def test_dataclass_return_value_publishes_its_type_path(raw_router: _RawRouter) -> None:
+    request = Packet(
+        intent=PacketIntent.DATA,
+        request=Request.GET_DEVICE_STRUCTURE,
+        source="some-client",
+        destination=RAW_PROVIDER_NAME,
+        payload=GetDeviceStructurePayload(instrument="measuring1").model_dump(),
+    )
+
+    reply = raw_router.ask(request)
+    structure = reply.payload
+
+    # A dataclass return value is not JSON-native: it publishes its Python import path (ADR-0002).
+    measure = structure["operations"]["measure"]
+    assert measure["returns_type"] == "tests.pytest.test_internal_network._Measurement"
+    assert measure["returns_schema"]["type"] == "object"
+    assert measure["returns_schema"]["properties"]["counts"] == {"title": "Counts", "type": "integer"}
+
+    # A bare list is JSON-native: a schema, but no type path.
+    labels = structure["operations"]["labels"]
+    assert labels["returns_type"] is None
+    assert labels["returns_schema"] == {"items": {}, "type": "array"}
+
+    # Calling the Operation returns the dataclass serialized via its return annotation.
+    call = Packet(
+        intent=PacketIntent.CONTROL,
+        request=Request.CALL_OPERATION,
+        source="some-client",
+        destination=RAW_PROVIDER_NAME,
+        payload=CallOperationPayload(instrument="measuring1", operation="measure").model_dump(),
+    )
+    call_reply = raw_router.ask(call)
+    assert call_reply.payload == {"value": {"counts": 3, "label": "counts"}}
+
+
 def test_return_values_are_serialized_via_the_return_annotation(raw_client: _RawClient) -> None:
     # Uses dummy2 and sets its state first, so the test does not depend on other tests' order.
     input_value = 30
@@ -678,6 +776,40 @@ class _BadParameterInstrument(DummyInstrument):
     def bad_parameter(self, value: _Unschemaable) -> None: ...
 
 
+class _BadInfoInstrument(DummyInstrument):
+    @property
+    def info(self) -> _Unschemaable: ...
+
+
+class _UnresolvableHintInstrument(DummyInstrument):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.operations["unresolvable"] = self.unresolvable
+
+    def unresolvable(self, value: "_NoSuchType") -> None: ...  # noqa: F821 - the hint must stay unresolvable
+
+
+@dataclass(frozen=True, slots=True)
+class _Measurement:
+    """A dataclass return value, to exercise non-null type paths (ADR-0002)."""
+
+    counts: int
+    label: str = "counts"
+
+
+class _MeasuringInstrument(DummyInstrument):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.operations["measure"] = self.measure
+        self.operations["labels"] = self.labels
+
+    def measure(self) -> _Measurement:
+        return _Measurement(counts=3)
+
+    def labels(self) -> list:
+        return ["a", "b"]
+
+
 def test_startup_fails_when_an_operation_type_hint_cannot_produce_a_json_schema() -> None:
     provider = InstrumentProvider(
         "bad-hints-provider",
@@ -710,4 +842,38 @@ def test_startup_fails_when_a_parameter_type_hint_cannot_produce_a_json_schema()
     )
 
     with pytest.raises(InvalidInstrumentsConfigurationError, match="bad_parameter"):
+        provider.start()
+
+
+def test_startup_fails_when_the_info_type_hint_cannot_produce_a_json_schema() -> None:
+    provider = InstrumentProvider(
+        "bad-hints-provider",
+        HOST,
+        _free_port(),
+        ROUTER_NAME,
+        bad={
+            "import": "tests.pytest.test_internal_network._BadInfoInstrument",
+            "desc": "Instrument with an unschemaable info",
+            "hw_address": "1234",
+        },
+    )
+
+    with pytest.raises(InvalidInstrumentsConfigurationError, match="info"):
+        provider.start()
+
+
+def test_startup_fails_when_a_type_hint_cannot_be_resolved() -> None:
+    provider = InstrumentProvider(
+        "bad-hints-provider",
+        HOST,
+        _free_port(),
+        ROUTER_NAME,
+        bad={
+            "import": "tests.pytest.test_internal_network._UnresolvableHintInstrument",
+            "desc": "Instrument with an unresolvable type hint",
+            "hw_address": "1234",
+        },
+    )
+
+    with pytest.raises(InvalidInstrumentsConfigurationError, match="unresolvable"):
         provider.start()
