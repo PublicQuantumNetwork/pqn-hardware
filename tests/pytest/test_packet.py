@@ -26,6 +26,7 @@ from pqn_hardware.network.packet import RegisterPayload
 from pqn_hardware.network.packet import Request
 from pqn_hardware.network.packet import SetParameterPayload
 from pqn_hardware.network.packet import ValuePayload
+from pqn_hardware.network.packet import create_registration_packet
 from pqn_hardware.network.packet import decode
 from pqn_hardware.network.packet import encode
 
@@ -130,33 +131,41 @@ def test_packet_round_trip(packet: Packet) -> None:
     assert decode(encode(packet)) == packet
 
 
-def _without_version(changes: dict[str, Any]) -> bytes:
-    """Encode a wire envelope without its version field, applying changes to the remaining fields."""
-    packet = Packet(intent=PacketIntent.DATA, request=Request.GET_DEVICES, source="source1", destination="dest1")
+def _without_version(packet: Packet, changes: dict[str, Any]) -> bytes:
+    """Encode a Packet's wire envelope without its version field, applying changes to the rest."""
     wire = json.loads(encode(packet))
     del wire["version"]
     return json.dumps({**wire, **changes}).encode("utf-8")
 
 
+_data_envelope = Packet(intent=PacketIntent.DATA, request=Request.GET_DEVICES, source="source1", destination="dest1")
+_registration_envelope = create_registration_packet(
+    source="source1", destination="router1", kind=NetworkElementClass.CLIENT
+)
+
+
 @pytest.mark.parametrize(
     "wire",
     [
-        _without_version({}),
-        _without_version({"payload": {"version": 7}}),
-        _without_version({"source": "version"}),
-        _without_version({"version": None}),
+        _without_version(_data_envelope, {}),
+        _without_version(_data_envelope, {"payload": {"version": 7}}),
+        _without_version(_data_envelope, {"source": "version"}),
+        _without_version(_data_envelope, {"version": None}),
+        _without_version(_registration_envelope, {}),
     ],
     ids=[
         "no-version-anywhere",
         "version-only-in-the-payload",
         "version-only-as-a-string-value",
         "explicit-null-version",
+        "registration-without-version",
     ],
 )
 def test_missing_version_fails_decode(wire: bytes) -> None:
     """A missing version on the wire fails validation; the default only applies to construction."""
     # The version must be the envelope's own field: a "version" inside the Payload, or only as
-    # a string value, is not a version, and neither is an explicit null.
+    # a string value, is not a version, and neither is an explicit null. Every Intent fails
+    # without it, a REGISTER included.
     with pytest.raises(ValidationError, match="version"):
         decode(wire)
 

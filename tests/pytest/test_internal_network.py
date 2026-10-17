@@ -1162,15 +1162,36 @@ def test_wrong_version_packets_are_refused_never_handled(network_port: int) -> N
 
 
 @pytest.mark.parametrize(
-    "wire",
-    [b"[1, 2, 3]", b'{"id": 42}', b'"abc"', b'{"reply_to": "abc", "intent": 5}'],
-    ids=["json-array", "id-not-a-string", "json-string", "reply-to-but-no-id"],
+    ("wire", "expected_reply_to"),
+    [
+        (b"[1, 2, 3]", None),
+        (b'{"id": 42}', None),
+        (b'"abc"', None),
+        (b'{"reply_to": "abc", "intent": 5}', None),
+        (b'{"id": "abc"}', "abc"),
+        (b'{"ID": "abc"}', None),
+        (b'{"Id": "abc"}', None),
+        (b'{"id": "ab\xffc"}', None),
+    ],
+    ids=[
+        "json-array",
+        "id-not-a-string",
+        "json-string",
+        "reply-to-but-no-id",
+        "id-only-no-intent",
+        "upper-case-id-key",
+        "mixed-case-id-key",
+        "invalid-utf8-in-id",
+    ],
 )
-def test_json_that_is_not_a_usable_envelope_gets_malformed_packet(network_port: int, wire: bytes) -> None:
+def test_json_that_is_not_a_usable_envelope_gets_malformed_packet(
+    network_port: int, wire: bytes, expected_reply_to: str | None
+) -> None:
     # Valid JSON that is not a usable envelope: a JSON array, a JSON object whose id is not
-    # a string, a bare JSON string, or a JSON object with a reply_to but no id (the echoed
-    # reply_to is the id or nothing). There is no readable id, so the error reply carries
-    # a null reply_to, and a follow-up request on the same socket is still answered.
+    # a string, a bare JSON string, a JSON object with a reply_to but no id, or bytes that
+    # are not UTF-8 and so not JSON at all. The echoed reply_to is the id when the data is a
+    # JSON object with a string id under exactly that key: any other key, case or no id
+    # at all gives a null reply_to. A follow-up request on the same socket is still answered.
     context = zmq.Context()
     socket = context.socket(zmq.REQ)
     socket.setsockopt(zmq.REQ_RELAXED, 1)
@@ -1191,7 +1212,7 @@ def test_json_that_is_not_a_usable_envelope_gets_malformed_packet(network_port: 
         reply = decode(socket.recv())
 
         assert reply.intent == PacketIntent.ERROR
-        assert reply.reply_to is None
+        assert reply.reply_to == expected_reply_to
         payload = ErrorPayload.model_validate(reply.payload)
         assert payload.code == ErrorCode.MALFORMED_PACKET
         assert payload.origin == ROUTER_NAME
@@ -1485,6 +1506,58 @@ def test_destination_names_are_matched_case_sensitively(network_port: int) -> No
         # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
         # context that outlives its socket can block the interpreter at exit in zmq term().
         socket.close()
+        context.term()
+
+
+@pytest.mark.parametrize("hops", [0, 100], ids=["small-hop-count", "large-hop-count"])
+def test_forwarded_packets_gain_exactly_one_hop(network_port: int, hops: int) -> None:
+    # The Router forwards a Packet with exactly one more hop, whatever its hop count: there is
+    # no limit on hops, so a large hop count is forwarded like any other. A Dealer standing in for the registered Provider receives the forwarded Packet.
+    context = zmq.Context()
+    dealer = context.socket(zmq.DEALER)
+    dealer.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+    dealer.setsockopt_string(zmq.IDENTITY, "hop-counting-provider")
+    dealer.connect(f"tcp://{HOST}:{network_port}")
+
+    registration = create_registration_packet(
+        source="hop-counting-provider", destination=ROUTER_NAME, kind=NetworkElementClass.PROVIDER
+    )
+    dealer.send(encode(registration))
+    _, ack_data = dealer.recv_multipart()
+    _assert_registration_ack(decode(ack_data), registration)
+
+    sender = context.socket(zmq.REQ)
+    sender.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+    sender.setsockopt_string(zmq.IDENTITY, "hop-counting-sender")
+    sender.connect(f"tcp://{HOST}:{network_port}")
+    sender_registration = create_registration_packet(
+        source="hop-counting-sender", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
+    )
+    sender.send(encode(sender_registration))
+    _assert_registration_ack(decode(sender.recv()), sender_registration)
+
+    try:
+        request = Packet(
+            intent=PacketIntent.PING,
+            request=Request.PING,
+            source="hop-counting-sender",
+            destination="hop-counting-provider",
+            hops=hops,
+        )
+        sender.send(encode(request))
+        _, data = dealer.recv_multipart()
+        forwarded = decode(data)
+
+        # The forwarded Packet is the request with one more hop, and nothing else changed.
+        assert forwarded.id == request.id
+        assert forwarded.hops == hops + 1
+        assert forwarded.intent == PacketIntent.PING
+        assert forwarded.request == Request.PING
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        sender.close()
+        dealer.close()
         context.term()
 
 
