@@ -1592,6 +1592,55 @@ def test_missing_version_gets_malformed_packet(network_port: int) -> None:
         context.term()
 
 
+def test_missing_id_gets_malformed_packet(network_port: int) -> None:
+    # A missing id fails envelope validation, exactly like a missing version: the
+    # Router replies MALFORMED_PACKET. The envelope carries no readable id, so the error reply
+    # carries a null reply_to, and the Router keeps serving afterwards.
+    context = zmq.Context()
+    socket = context.socket(zmq.REQ)
+    socket.setsockopt(zmq.REQ_RELAXED, 1)
+    socket.setsockopt(zmq.REQ_CORRELATE, 1)
+    socket.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+    socket.setsockopt_string(zmq.IDENTITY, "no-id-client")
+    socket.connect(f"tcp://{HOST}:{network_port}")
+
+    registration = create_registration_packet(
+        source="no-id-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
+    )
+    socket.send(encode(registration))
+    registration_ack = decode(socket.recv())
+    _assert_registration_ack(registration_ack, registration)
+
+    try:
+        # A hand-written wire envelope with no id at all.
+        request = Packet(
+            intent=PacketIntent.PING, request=Request.PING, source="no-id-client", destination=PROVIDER_NAME
+        )
+        wire = json.loads(encode(request))
+        del wire["id"]
+        socket.send(json.dumps(wire).encode("utf-8"))
+        reply = decode(socket.recv())
+
+        assert reply.intent == PacketIntent.ERROR
+        # There is no id to echo, so the error reply carries a null reply_to.
+        assert reply.reply_to is None
+        payload = ErrorPayload.model_validate(reply.payload)
+        assert payload.code == ErrorCode.MALFORMED_PACKET
+        assert payload.origin == ROUTER_NAME
+
+        # The Router keeps serving after the missing id.
+        ping = Packet(intent=PacketIntent.PING, request=Request.PING, source="no-id-client", destination=PROVIDER_NAME)
+        socket.send(encode(ping))
+        pong = decode(socket.recv())
+        assert pong.request == Request.PONG
+        assert pong.reply_to == ping.id
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        socket.close()
+        context.term()
+
+
 @pytest.mark.parametrize(
     "payload",
     [{"kind": "NOT_A_KIND"}, None],
@@ -3245,6 +3294,34 @@ def test_error_malformed_packet_on_undecodable_bytes(raw_router: _RawRouter) -> 
     payload = ErrorPayload.model_validate(reply.payload)
     assert payload.code == ErrorCode.MALFORMED_PACKET
     assert payload.origin == RAW_PROVIDER_NAME
+
+
+def test_missing_id_gets_malformed_packet_from_the_provider(raw_router: _RawRouter) -> None:
+    # A missing id fails envelope validation: the Provider replies MALFORMED_PACKET, like
+    # the Router does. There is no id to echo, so reply_to is null and the reply goes to the
+    # Router, and the Provider keeps serving afterwards.
+    request = Packet(
+        intent=PacketIntent.DATA, request=Request.GET_DEVICES, source="some-client", destination=RAW_PROVIDER_NAME
+    )
+    wire = json.loads(encode(request))
+    del wire["id"]
+    raw_router.send_bytes(json.dumps(wire).encode("utf-8"))
+    reply = raw_router.receive()
+
+    assert reply.intent == PacketIntent.ERROR
+    assert reply.reply_to is None
+    assert reply.destination == ROUTER_NAME
+    payload = ErrorPayload.model_validate(reply.payload)
+    assert payload.code == ErrorCode.MALFORMED_PACKET
+    assert payload.origin == RAW_PROVIDER_NAME
+
+    # The Provider keeps serving after the missing id.
+    follow_up = Packet(
+        intent=PacketIntent.DATA, request=Request.GET_DEVICES, source="some-client", destination=RAW_PROVIDER_NAME
+    )
+    follow_up_reply = raw_router.ask(follow_up)
+    assert follow_up_reply.reply_to == follow_up.id
+    assert "dummy1" in follow_up_reply.payload["devices"]
 
 
 def test_error_malformed_packet_on_wrong_frame_count(raw_router: _RawRouter) -> None:

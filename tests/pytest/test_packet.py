@@ -178,10 +178,10 @@ def test_packet_round_trip(packet: Packet) -> None:
     assert decode(encode(packet)) == packet
 
 
-def _without_version(packet: Packet, changes: dict[str, Any]) -> bytes:
-    """Encode a Packet's wire envelope without its version field, applying changes to the rest."""
+def _without_field(packet: Packet, field: str, changes: dict[str, Any]) -> bytes:
+    """Encode a Packet's wire envelope without one field, applying changes to the rest."""
     wire = json.loads(encode(packet))
-    del wire["version"]
+    del wire[field]
     return json.dumps({**wire, **changes}).encode("utf-8")
 
 
@@ -194,11 +194,11 @@ _registration_envelope = create_registration_packet(
 @pytest.mark.parametrize(
     "wire",
     [
-        _without_version(_data_envelope, {}),
-        _without_version(_data_envelope, {"payload": {"version": 7}}),
-        _without_version(_data_envelope, {"source": "version"}),
-        _without_version(_data_envelope, {"version": None}),
-        _without_version(_registration_envelope, {}),
+        _without_field(_data_envelope, "version", {}),
+        _without_field(_data_envelope, "version", {"payload": {"version": 7}}),
+        _without_field(_data_envelope, "version", {"source": "version"}),
+        _without_field(_data_envelope, "version", {"version": None}),
+        _without_field(_registration_envelope, "version", {}),
     ],
     ids=[
         "no-version-anywhere",
@@ -214,6 +214,29 @@ def test_missing_version_fails_decode(wire: bytes) -> None:
     # a string value, is not a version, and neither is an explicit null. Every Intent fails
     # without it, a REGISTER included.
     with pytest.raises(ValidationError, match="version"):
+        decode(wire)
+
+
+@pytest.mark.parametrize(
+    "wire",
+    [
+        _without_field(_data_envelope, "id", {}),
+        _without_field(_data_envelope, "id", {"payload": {"id": "an-id"}}),
+        _without_field(_data_envelope, "id", {"reply_to": "an-id"}),
+        _without_field(_data_envelope, "id", {"id": None}),
+    ],
+    ids=[
+        "no-id-anywhere",
+        "id-only-inside-the-payload",
+        "id-only-as-a-reply-to",
+        "explicit-null-id",
+    ],
+)
+def test_missing_id_fails_decode(wire: bytes) -> None:
+    """A missing id on the wire fails validation; the default only applies to construction."""
+    # The id must be the envelope's own field: an id inside the Payload, or only as a reply_to,
+    # is not a correlation id, and neither is an explicit null.
+    with pytest.raises(ValidationError, match="id"):
         decode(wire)
 
 

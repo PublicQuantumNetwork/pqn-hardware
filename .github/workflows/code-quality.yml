@@ -54,6 +54,24 @@ jobs:
         with:
           enable-cache: true
       - run: uv run scripts/test
+  protocol-version:
+    runs-on: ubuntu-latest
+    needs: lockfile
+    steps:
+      # The version check reads protocol/schema.json from origin/master, so it needs more than
+      # the one commit actions/checkout fetches by default.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - name: Read the protocol schema from master
+        run: git show origin/master:protocol/schema.json > "$RUNNER_TEMP/master-schema.json" || true
+      - name: Check the committed schema is not stale
+        run: uv run scripts/protocol_schema check
+      - name: Check schema changes bump PROTOCOL_VERSION
+        run: uv run scripts/protocol_schema check-version --old-schema "$RUNNER_TEMP/master-schema.json"
   build:
     runs-on: ubuntu-latest
     needs: [lint, format, typecheck, test]
