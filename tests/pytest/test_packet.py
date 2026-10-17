@@ -212,9 +212,10 @@ def test_missing_version_fails_decode(wire: bytes) -> None:
     """A missing version on the wire fails validation; the default only applies to construction."""
     # The version must be the envelope's own field: a "version" inside the Payload, or only as
     # a string value, is not a version, and neither is an explicit null. Every Intent fails
-    # without it, a REGISTER included.
-    with pytest.raises(ValidationError, match="version"):
+    # without it, a REGISTER included. The error names the missing field exactly.
+    with pytest.raises(ValidationError) as exc_info:
         decode(wire)
+    assert exc_info.value.errors()[0]["loc"] == ("version",)
 
 
 @pytest.mark.parametrize(
@@ -235,9 +236,11 @@ def test_missing_version_fails_decode(wire: bytes) -> None:
 def test_missing_id_fails_decode(wire: bytes) -> None:
     """A missing id on the wire fails validation; the default only applies to construction."""
     # The id must be the envelope's own field: an id inside the Payload, or only as a reply_to,
-    # is not a correlation id, and neither is an explicit null.
-    with pytest.raises(ValidationError, match="id"):
+    # is not a correlation id, and neither is an explicit null. The error names the missing
+    # field exactly.
+    with pytest.raises(ValidationError) as exc_info:
         decode(wire)
+    assert exc_info.value.errors()[0]["loc"] == ("id",)
 
 
 def test_enums_serialize_by_name() -> None:

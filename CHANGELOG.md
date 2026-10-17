@@ -33,6 +33,6 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Inter-node communication.
 - This CHANGELOG file to track notable changes in the project.
 
-[unreleased]: https://github.com/PublicQuantumNetwork/pqn-stack/compare/0.3.0...HEAD
-[0.3.0]: https://github.com/PublicQuantumNetwork/pqn-stack/compare/0.1.0...0.3.0
+[unreleased]: https://github.com/PublicQuantumNetwork/pqn-hardware/compare/0.3.0...HEAD
+[0.3.0]: https://github.com/PublicQuantumNetwork/pqn-hardware/compare/0.1.0...0.3.0
 [0.1.0]: https://github.com/PublicQuantumNetwork/pqn-stack/releases/tag/0.1.0

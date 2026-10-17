@@ -20,6 +20,7 @@ from typing import Any
 
 import pytest
 import zmq
+from jsonschema import ValidationError
 from jsonschema import validate
 
 # The system under test: the real Router and Provider, started in-process with the existing
@@ -356,3 +357,22 @@ def test_error_reply_carries_the_error_payload(client_peer: RawReqPeer) -> None:
     assert error["origin"] == ROUTER_NAME
     assert isinstance(error["message"], str)
     assert error["details"] == {}
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("id", None), ("version", None), ("intent", "BOGUS")],
+    ids=["missing-id", "missing-version", "unknown-intent"],
+)
+def test_the_schema_rejects_what_decode_rejects(field: str, value: str | None) -> None:
+    # A non-Python peer implements against protocol/schema.json alone, so the schema must reject
+    # what decode rejects: an envelope without an id, without a version, or with an
+    # unknown Intent value.
+    message = envelope("PING", "PING", INTEROP_CLIENT_NAME, ROUTER_NAME)
+    if value is None:
+        del message[field]
+    else:
+        message[field] = value
+
+    with pytest.raises(ValidationError):
+        validate_message(message, None)
