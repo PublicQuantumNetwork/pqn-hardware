@@ -2030,6 +2030,77 @@ def test_killing_a_provider_then_sending_gets_destination_unreachable_quickly() 
         _stop_router(router)
 
 
+def test_an_undeliverable_packet_gets_exactly_one_error_reply() -> None:
+    # A Packet to a destination that cannot be reached gets exactly one error reply: the
+    # Router never answers the same Packet twice. A REQ Client keeps only the first reply,
+    # so a second, contradictory one would go unnoticed by it; a DEALER peer (e.g. a
+    # Provider replying to a peer that went away) receives every reply the Router sends, so
+    # the count is asserted from one. A registered Provider that has gone away gets
+    # DESTINATION_UNREACHABLE; a name that was never registered gets UNKNOWN_DESTINATION.
+    port = _free_port()
+    router = Router(ROUTER_NAME, HOST, port)
+    threading.Thread(target=router.start, daemon=True).start()
+    _wait_until(lambda: router.running, 10, "Router did not start.")
+
+    context = zmq.Context()
+    # A Provider that registers and then goes away: it stays in the Directory (entries are
+    # never removed), so Packets to it are undeliverable, not unknown.
+    gone = context.socket(zmq.DEALER)
+    gone.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+    gone.setsockopt_string(zmq.IDENTITY, "gone-provider")
+    gone.connect(f"tcp://{HOST}:{port}")
+    gone_registration = create_registration_packet(
+        source="gone-provider", destination=ROUTER_NAME, kind=NetworkElementClass.PROVIDER
+    )
+    gone.send(encode(gone_registration))
+    _, gone_ack = gone.recv_multipart()
+    _assert_registration_ack(decode(gone_ack), gone_registration)
+    gone.close(linger=0)
+    # Let the Router's connection table drop the closed peer, as the killing test does.
+    time.sleep(0.5)
+
+    # The sender: a Provider-like DEALER, so it receives every reply the Router sends it.
+    sender = context.socket(zmq.DEALER)
+    sender.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+    sender.setsockopt_string(zmq.IDENTITY, "reply-counting-provider")
+    sender.connect(f"tcp://{HOST}:{port}")
+    sender_registration = create_registration_packet(
+        source="reply-counting-provider", destination=ROUTER_NAME, kind=NetworkElementClass.PROVIDER
+    )
+    sender.send(encode(sender_registration))
+    _, sender_ack = sender.recv_multipart()
+    _assert_registration_ack(decode(sender_ack), sender_registration)
+
+    poller = zmq.Poller()
+    poller.register(sender, zmq.POLLIN)
+    try:
+        for destination, expected_code in (
+            ("gone-provider", ErrorCode.DESTINATION_UNREACHABLE),
+            ("never-registered", ErrorCode.UNKNOWN_DESTINATION),
+        ):
+            packet = Packet(
+                intent=PacketIntent.DATA,
+                request=Request.GET_DEVICE_STRUCTURE,
+                source="reply-counting-provider",
+                destination=destination,
+            )
+            sender.send(encode(packet))
+            replies = dict(poller.poll(ERROR_TIMEOUT_MS))
+            assert sender in replies, f"no error reply arrived for '{destination}'"
+            _, reply_data = sender.recv_multipart()
+            _assert_error_reply(decode(reply_data), packet, expected_code, ROUTER_NAME)
+
+            # Exactly one reply: nothing else arrives for the same Packet within the window.
+            extra = dict(poller.poll(500))
+            assert sender not in extra, f"a second reply arrived for '{destination}'"
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        sender.close(linger=0)
+        context.term()
+        _stop_router(router)
+
+
 def test_restarting_the_router_lets_the_client_and_provider_talk_again() -> None:
     # After a Router restart the Client never re-registers: delivery is by identity, so the
     # same Client and Provider talk again on the restarted Router without being re-created
