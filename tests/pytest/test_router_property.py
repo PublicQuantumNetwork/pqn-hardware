@@ -43,6 +43,7 @@ from pqn_hardware.network.packet import create_registration_packet
 from pqn_hardware.network.packet import decode
 from pqn_hardware.network.packet import encode
 from pqn_hardware.network.router import Router
+from tests.pytest.test_internal_network import ERROR_TIMEOUT_MS
 from tests.pytest.test_internal_network import HOST
 from tests.pytest.test_internal_network import ROUTER_NAME
 from tests.pytest.test_internal_network import _free_port
@@ -63,9 +64,10 @@ UNKNOWN_NAME = "no-such-destination"
 DESTINATIONS = (ROUTER_NAME, REGISTERED_PROVIDER, LURKER, UNKNOWN_NAME)
 CONNECTED_PEERS = (REGISTERED_PROVIDER, LURKER)
 
-# Every reply must arrive well inside this bound; the receive timeout fails a missing reply
-# fast. Replies on localhost take milliseconds, so a short bound still tells reply from silence.
-REPLY_TIMEOUT_MS = 150
+# Reply-expecting receives use the shared generous bound (ERROR_TIMEOUT_MS): up to eight
+# suites run at once in this workflow, and a reply slowed by load is still a reply. Checks
+# that expect silence keep the short bound below, which is what tells reply from silence.
+SILENCE_WINDOW_MS = 200
 
 
 class _PropertyRouter:
@@ -81,7 +83,7 @@ class _PropertyRouter:
         self.peers: dict[str, zmq.Socket[bytes]] = {}
         for name in (REGISTERED_PROVIDER, LURKER, SENDER_NAME):
             peer = self.context.socket(zmq.DEALER)
-            peer.setsockopt(zmq.RCVTIMEO, REPLY_TIMEOUT_MS)
+            peer.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
             peer.setsockopt_string(zmq.IDENTITY, name)
             peer.connect(f"tcp://{HOST}:{self.port}")
             self.peers[name] = peer
@@ -107,6 +109,12 @@ class _PropertyRouter:
         except zmq.error.Again:
             return None
         return decode(data)
+
+    def receive_nothing(self, name: str) -> bool:
+        """Return True when nothing arrives on a peer's socket within the silence window."""
+        poller = zmq.Poller()
+        poller.register(self.peers[name], zmq.POLLIN)
+        return not poller.poll(SILENCE_WINDOW_MS)
 
     def close(self) -> None:
         try:
@@ -154,7 +162,7 @@ def _assert_request_to_router(property_router: _PropertyRouter, packet: Packet) 
     """Assert the outcome step 5 prescribes for a request to the Router."""
     if packet.intent == PacketIntent.ERROR:
         # An ERROR Packet addressed to the Router is logged, never answered.
-        assert property_router.receive(SENDER_NAME) is None
+        assert property_router.receive_nothing(SENDER_NAME)
         _assert_still_running(property_router)
         return
     match packet.request:
@@ -202,13 +210,13 @@ def _assert_forwarding(property_router: _PropertyRouter, packet: Packet) -> None
         forwarded = property_router.receive(packet.destination)
         assert forwarded is not None, "a Packet to a connected peer must be forwarded"
         assert forwarded == packet.model_copy(update={"hops": packet.hops + 1})
-        assert property_router.receive(SENDER_NAME) is None
+        assert property_router.receive_nothing(SENDER_NAME)
         return
 
     if packet.intent == PacketIntent.ERROR:
         # An ERROR Packet the Router cannot deliver is dropped with a warning, never
         # answered: the sender never answers an ERROR either, so it would only log the answer.
-        assert property_router.receive(SENDER_NAME) is None
+        assert property_router.receive_nothing(SENDER_NAME)
         _assert_still_running(property_router)
         return
 

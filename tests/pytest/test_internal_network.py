@@ -12,12 +12,15 @@ import threading
 import time
 from collections.abc import Generator
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import pytest
 import zmq
 from pydantic import ValidationError
 
+from pqn_hardware.cli import _load_and_parse_router_config
+from pqn_hardware.cli import start_router
 from pqn_hardware.drivers.dummies import DummyInfo
 from pqn_hardware.drivers.dummies import DummyInstrument
 from pqn_hardware.errors import InvalidInstrumentsConfigurationError
@@ -44,6 +47,8 @@ from pqn_hardware.network.packet import SetParameterPayload
 from pqn_hardware.network.packet import create_registration_packet
 from pqn_hardware.network.packet import decode
 from pqn_hardware.network.packet import encode
+from pqn_hardware.network.router import ZMQ_HEARTBEAT_IVL
+from pqn_hardware.network.router import ZMQ_HEARTBEAT_TIMEOUT
 from pqn_hardware.network.router import Router
 
 logger = logging.getLogger(__name__)
@@ -1928,12 +1933,16 @@ def test_ping_to_the_router_gets_pong(raw_client: _RawClient) -> None:
 
 def test_get_providers_lists_devices_and_a_sensible_last_seen(network_port: int) -> None:
     # Other tests in this module register their own Providers on the same Router, and
-    # Directory entries are never removed, so this test checks the Provider it knows about.
+    # Directory entries are never removed, so this test checks the Providers it knows about.
     client = _client(network_port)
+    # A registered Client: the Directory holds a single record per registered Provider, so a
+    # Client's REGISTER is ACKed but never enters the Directory.
+    listed_client = _RawClient(network_port, "never-listed-client")
     try:
         first = client.get_providers()
 
         assert PROVIDER_NAME in first
+        assert "never-listed-client" not in first
         provider = first[PROVIDER_NAME]
         # The devices the Provider reported at registration are listed.
         assert provider.devices == client.get_available_devices(PROVIDER_NAME)
@@ -1949,10 +1958,12 @@ def test_get_providers_lists_devices_and_a_sensible_last_seen(network_port: int)
         time.sleep(2)
         second = client.get_providers()
         assert second[PROVIDER_NAME].last_seen > last_seen
+        assert "never-listed-client" not in second
     finally:
         # Close the socket while the Client is alive: a Client that only dies by garbage
         # collection can block another thread's garbage collection in zmq Context.term().
         client.disconnect()
+        listed_client.close()
 
 
 def test_killing_a_provider_then_sending_gets_destination_unreachable_quickly() -> None:
@@ -2066,6 +2077,162 @@ def test_restarting_the_router_lets_the_client_and_provider_talk_again() -> None
         client.disconnect()
         provider.running = False
         _stop_router(restarted)
+
+
+def _flood_until_unreachable(sender: zmq.Socket[bytes], flood_packet: Packet) -> Packet | None:
+    """Flood Packets to the stuck Provider until the Router's send queue is full.
+
+    Returns the reply to the flood, or None when the queue never filled within the bound.
+    """
+    flood_batch = 500
+    flood_batches = 8
+    for _ in range(flood_batches):
+        for _ in range(flood_batch):
+            sender.send(encode(flood_packet))
+        try:
+            return decode(sender.recv())
+        except zmq.error.Again:
+            # The flood Packet was still queued for the stuck Provider: keep flooding.
+            continue
+    return None
+
+
+def test_a_peer_at_its_high_water_mark_gets_destination_unreachable_and_the_router_keeps_serving() -> None:
+    # A connected Provider that stops reading (stuck in a long Operation, or gone half-open
+    # before the transport heartbeat closes it) fills the Router's send queue. The Router's
+    # sends never block (zmq.DONTWAIT in _send), so a Packet to the stuck Provider raises
+    # instead of freezing the Router: the sender gets DESTINATION_UNREACHABLE with the
+    # Provider's Last seen, and the Router keeps serving right after.
+    port = _free_port()
+    router = Router(ROUTER_NAME, HOST, port)
+    threading.Thread(target=router.start, daemon=True).start()
+    _wait_until(lambda: router.running, 10, "Router did not start.")
+
+    context = zmq.Context()
+    # The stuck Provider stand-in: a receive high-water mark of one message, and no reads
+    # after its registration, so the Router's sends to it cannot be queued for long.
+    stuck = context.socket(zmq.DEALER)
+    stuck.setsockopt(zmq.RCVHWM, 1)
+    stuck.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+    stuck.setsockopt_string(zmq.IDENTITY, "stuck-provider")
+    stuck.connect(f"tcp://{HOST}:{port}")
+    stuck_registration = create_registration_packet(
+        source="stuck-provider", destination=ROUTER_NAME, kind=NetworkElementClass.PROVIDER
+    )
+    stuck.send(encode(stuck_registration))
+    _, ack_data = stuck.recv_multipart()
+    _assert_registration_ack(decode(ack_data), stuck_registration)
+
+    # The sender floods Packets addressed to the stuck Provider until its send queue is full.
+    # The Packets are large, so the TCP window cannot absorb them and the queue fills after
+    # about a thousand sends, well inside the flood bound below.
+    sender = context.socket(zmq.REQ)
+    sender.setsockopt(zmq.REQ_RELAXED, 1)
+    sender.setsockopt(zmq.REQ_CORRELATE, 1)
+    poll_timeout_ms = 100
+    sender.setsockopt(zmq.RCVTIMEO, poll_timeout_ms)
+    sender.setsockopt_string(zmq.IDENTITY, "hwm-client")
+    sender.connect(f"tcp://{HOST}:{port}")
+    sender_registration = create_registration_packet(
+        source="hwm-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
+    )
+    sender.send(encode(sender_registration))
+    _assert_registration_ack(decode(sender.recv()), sender_registration)
+
+    flood_packet = Packet(
+        intent=PacketIntent.DATA,
+        request=Request.GET_DEVICE_STRUCTURE,
+        source="hwm-client",
+        destination="stuck-provider",
+        payload={"padding": "x" * 10_000},
+    )
+    try:
+        reply = _flood_until_unreachable(sender, flood_packet)
+        assert reply is not None, "the stuck Provider's send queue never filled; EAGAIN was never raised"
+        error = _assert_error_reply(reply, flood_packet, ErrorCode.DESTINATION_UNREACHABLE, ROUTER_NAME)
+        # The stuck Provider is in the Directory, so the details carry its Last seen.
+        assert "last_seen" in error.details
+
+        # The Router still serves right after the stuck Provider filled its queue.
+        router_ping = Packet(
+            intent=PacketIntent.PING, request=Request.PING, source="hwm-client", destination=ROUTER_NAME
+        )
+        sender.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+        sender.send(encode(router_ping))
+        pong = decode(sender.recv())
+        assert pong.request == Request.PONG
+        assert pong.source == ROUTER_NAME
+        assert pong.reply_to == router_ping.id
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        sender.close()
+        stuck.close()
+        context.term()
+        _stop_router(router)
+
+
+def test_router_heartbeat_options_are_configurable() -> None:
+    # The ZMQ transport heartbeats are configurable: a Router started with
+    # other values carries them on its socket, and a Router started without them uses the defaults.
+    configured_ivl_ms = 250
+    configured_timeout_ms = 750
+    port = _free_port()
+    router = Router(ROUTER_NAME, HOST, port, heartbeat_ivl=configured_ivl_ms, heartbeat_timeout=configured_timeout_ms)
+    threading.Thread(target=router.start, daemon=True).start()
+    try:
+        _wait_until(lambda: router.running, 10, "Router did not start.")
+        assert router.socket is not None
+        assert router.socket.getsockopt(zmq.HEARTBEAT_IVL) == configured_ivl_ms
+        assert router.socket.getsockopt(zmq.HEARTBEAT_TIMEOUT) == configured_timeout_ms
+    finally:
+        _stop_router(router)
+
+    # The defaults are 1000 ms and 5000 ms.
+    default_ivl_ms = 1000
+    default_timeout_ms = 5000
+    default_router = Router(ROUTER_NAME, HOST, port)
+    assert default_router.heartbeat_ivl == ZMQ_HEARTBEAT_IVL == default_ivl_ms
+    assert default_router.heartbeat_timeout == ZMQ_HEARTBEAT_TIMEOUT == default_timeout_ms
+
+
+def test_router_config_reads_the_heartbeat_keys(tmp_path: Path) -> None:
+    config = tmp_path / "router.toml"
+    config.write_text(
+        "[router]\n"
+        'name = "configured-router"\n'
+        'host = "127.0.0.1"\n'
+        "port = 5555\n"
+        "heartbeat_ivl = 250\n"
+        "heartbeat_timeout = 750\n"
+    )
+
+    kwargs = _load_and_parse_router_config(config, {})
+
+    assert kwargs == {
+        "name": "configured-router",
+        "host": "127.0.0.1",
+        "port": 5555,
+        "heartbeat_ivl": 250,
+        "heartbeat_timeout": 750,
+    }
+
+
+def test_start_router_options_reach_the_router(monkeypatch: pytest.MonkeyPatch) -> None:
+    started: list[dict[str, str | int]] = []
+
+    class _FakeRouter:
+        def __init__(self, **kwargs: str | int) -> None:
+            started.append(kwargs)
+
+        def start(self) -> None:
+            return None
+
+    monkeypatch.setattr("pqn_hardware.cli.Router", _FakeRouter)
+
+    start_router(name="cli-router", heartbeat_ivl=250, heartbeat_timeout=750)
+
+    assert started == [{"name": "cli-router", "heartbeat_ivl": 250, "heartbeat_timeout": 750}]
 
 
 @pytest.mark.parametrize("hops", [0, 1], ids=["hops-0", "hops-1"])

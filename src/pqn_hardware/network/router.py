@@ -338,7 +338,11 @@ class Router:
                 frame = remembered[0]
         if frame is not None:
             frames.insert(1, frame)
-        self.socket.send_multipart(frames)
+        # Sends never block the Router: a peer that stopped reading (stuck in a long
+        # Operation, or half-open until the transport heartbeat closes it) would otherwise
+        # freeze every other peer's traffic. A send that cannot be queued right now raises
+        # EAGAIN, which the caller maps (to UNKNOWN_DESTINATION or DESTINATION_UNREACHABLE for forwards) or logs and drops (own replies).
+        self.socket.send_multipart(frames, flags=zmq.DONTWAIT)
         logger.info("Packet sent to %s", packet.destination)
 
     def handle_packet_error(  # noqa: PLR0913
