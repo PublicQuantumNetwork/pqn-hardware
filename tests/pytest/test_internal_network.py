@@ -6,6 +6,7 @@ The CLI smoke test in test_cli_smoke.py covers starting the same elements as sub
 import datetime
 import json
 import logging
+import re
 import socket
 import threading
 import time
@@ -275,6 +276,9 @@ def _assert_error_reply(reply: Packet, request: Packet, code: ErrorCode, origin:
     assert reply.request == Request.ERROR
     assert reply.destination == request.source
     assert reply.reply_to == request.id
+    # The error reply is its own Packet: its id is unique, never the request's id.
+    assert reply.id != request.id
+    assert re.fullmatch(r"[0-9a-f]{32}", reply.id) is not None
     payload = ErrorPayload.model_validate(reply.payload)
     assert payload.code == code
     assert payload.origin == origin
@@ -287,6 +291,9 @@ def _assert_registration_ack(ack: Packet, registration: Packet) -> None:
     assert ack.request == Request.ACKNOWLEDGE
     assert ack.payload is None
     assert ack.reply_to == registration.id
+    # The acknowledgement is its own Packet: its id is unique, never the registration's id.
+    assert ack.id != registration.id
+    assert re.fullmatch(r"[0-9a-f]{32}", ack.id) is not None
 
 
 def test_client_ping(network_port: int) -> None:
@@ -1201,6 +1208,7 @@ _pretty_printed_wire = json.dumps(
         (_pretty_printed_wire, "pretty-printed-id"),
         (b'[{"id": "x"}]', None),
         (b'\x00{"id": "x"}', None),
+        (b'{"id": "abc", "reply_to": "def"}', "abc"),
     ],
     ids=[
         "json-array",
@@ -1215,6 +1223,7 @@ _pretty_printed_wire = json.dumps(
         "pretty-printed-no-version",
         "object-inside-a-json-array",
         "leading-nul-byte",
+        "id-and-reply-to",
     ],
 )
 def test_json_that_is_not_a_usable_envelope_gets_malformed_packet(
@@ -1349,11 +1358,56 @@ def test_unsupported_version_register_gets_unsupported_version_error(
 
 
 @pytest.mark.parametrize("hops", [0, 1], ids=["hops-0", "hops-1"])
+def test_a_register_at_any_hop_count_gets_its_acknowledgement(network_port: int, hops: int) -> None:
+    # A REGISTER is handled at whatever hop count it arrives with: it always gets its
+    # REGISTRATION_ACK, never a silent drop.
+    context = zmq.Context()
+    socket = context.socket(zmq.REQ)
+    socket.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+    socket.setsockopt_string(zmq.IDENTITY, "any-hops-client")
+    socket.connect(f"tcp://{HOST}:{network_port}")
+
+    try:
+        registration = create_registration_packet(
+            source="any-hops-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT, hops=hops
+        )
+        socket.send(encode(registration))
+        _assert_registration_ack(decode(socket.recv()), registration)
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        socket.close()
+        context.term()
+
+
+@pytest.mark.parametrize(
+    ("intent", "verb", "payload"),
+    [
+        (PacketIntent.DATA, Request.GET_DEVICES, None),
+        (
+            PacketIntent.CONTROL,
+            Request.GET_PARAMETER,
+            GetParameterPayload(instrument="dummy1", parameter="param_int").model_dump(),
+        ),
+        (PacketIntent.PING, Request.PING, None),
+        (PacketIntent.REGISTRATION, Request.REGISTER, RegisterPayload(kind=NetworkElementClass.CLIENT).model_dump()),
+        (
+            PacketIntent.ERROR,
+            Request.ERROR,
+            ErrorPayload(code=ErrorCode.INSTRUMENT_ERROR, message="a stale error", origin="stale-peer").model_dump(),
+        ),
+    ],
+    ids=["data", "control", "ping", "registration", "error"],
+)
+@pytest.mark.parametrize("hops", [0, 1], ids=["hops-0", "hops-1"])
 @pytest.mark.parametrize("version", [1, 3], ids=["older-version", "newer-version"])
-def test_unsupported_version_gets_unsupported_version_error(network_port: int, version: int, hops: int) -> None:
-    # A version this Router does not speak, older or newer, whatever the hop count (an exact
-    # match), gets a fast UNSUPPORTED_VERSION reply whose details carry the
-    # expected and received versions, and the Router keeps serving afterwards.
+def test_unsupported_version_gets_unsupported_version_error(  # noqa: PLR0913 - one parametrize dimension per facet
+    network_port: int, version: int, hops: int, intent: PacketIntent, verb: Request, payload: dict[str, Any] | None
+) -> None:
+    # A version this Router does not speak, older or newer, whatever the hop count and
+    # whatever the Intent (an exact match), gets a fast UNSUPPORTED_VERSION
+    # reply whose details carry the expected and received versions, and the Router keeps
+    # serving afterwards.
     context = zmq.Context()
     socket = context.socket(zmq.REQ)
     socket.setsockopt(zmq.REQ_RELAXED, 1)
@@ -1372,7 +1426,7 @@ def test_unsupported_version_gets_unsupported_version_error(network_port: int, v
     try:
         # A hand-written wire envelope speaking another protocol version.
         request = Packet(
-            intent=PacketIntent.PING, request=Request.PING, source="old-version-client", destination=PROVIDER_NAME
+            intent=intent, request=verb, source="old-version-client", destination=PROVIDER_NAME, payload=payload
         )
         wire = json.loads(encode(request))
         wire["version"] = version
@@ -1507,10 +1561,11 @@ def test_invalid_registration_payload_gets_malformed_packet(network_port: int, p
         context.term()
 
 
-def test_unknown_destination_error_lists_registered_providers(network_port: int) -> None:
+@pytest.mark.parametrize("hops", [0, 1], ids=["hops-0", "hops-1"])
+def test_unknown_destination_error_lists_registered_providers(network_port: int, hops: int) -> None:
     # The UNKNOWN_DESTINATION reply lists the Providers registered with the Router,
-    # every one of them, including the one that sent the Packet, so the message says
-    # what went wrong instead of "Routing not implemented yet."
+    # every one of them, including the one that sent the Packet, whatever the hop
+    # count, so the message says what went wrong instead of "Routing not implemented yet."
     context = zmq.Context()
     dealer = context.socket(zmq.DEALER)
     dealer.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
@@ -1533,6 +1588,7 @@ def test_unknown_destination_error_lists_registered_providers(network_port: int)
             request=Request.GET_DEVICES,
             source="second-provider",
             destination="no-such-provider",
+            hops=hops,
         )
         dealer.send(encode(request))
         _, error_data = dealer.recv_multipart()
@@ -1593,6 +1649,11 @@ def test_destination_names_are_matched_exactly(network_port: int, destination: s
 
 
 @pytest.mark.parametrize(
+    ("intent", "verb"),
+    [(PacketIntent.PING, Request.PING), (PacketIntent.ERROR, Request.ERROR)],
+    ids=["ping-packet", "error-packet"],
+)
+@pytest.mark.parametrize(
     ("receiver_kind", "receiver"),
     [
         (NetworkElementClass.PROVIDER, "hop-counting-provider"),
@@ -1600,15 +1661,17 @@ def test_destination_names_are_matched_exactly(network_port: int, destination: s
     ],
     ids=["receiver-provider", "receiver-client"],
 )
-@pytest.mark.parametrize("hops", [0, 100], ids=["small-hop-count", "large-hop-count"])
-def test_forwarded_packets_gain_exactly_one_hop(
-    network_port: int, hops: int, receiver_kind: NetworkElementClass, receiver: str
+@pytest.mark.parametrize("hops", [0, 100, 2**31], ids=["small-hop-count", "large-hop-count", "huge-hop-count"])
+def test_forwarded_packets_gain_exactly_one_hop(  # noqa: PLR0913 - one parametrize dimension per facet
+    network_port: int, hops: int, receiver_kind: NetworkElementClass, receiver: str, intent: PacketIntent, verb: Request
 ) -> None:
-    # The Router forwards a Packet with exactly one more hop, whatever its hop count and
-    # whoever the registered receiver is: there is no limit on
-    # hops, and a Client is a forwardable destination like a Provider. A Dealer standing in
-    # for the registered receiver receives the forwarded Packet. The receiver's name is
-    # unique to its kind, so the Client case can never ride on a Provider registration.
+    # The Router forwards a Packet with exactly one more hop, whatever its hop count (even a
+    # huge one), whatever its Intent (an ERROR Packet addressed to a registered peer is
+    # forwarded like any other) and whoever the registered receiver is:
+    # there is no limit on hops, and a Client is a forwardable destination like a
+    # Provider. A Dealer standing in for the registered receiver receives the forwarded
+    # Packet. The receiver's name is unique to its kind, so the Client case can never ride on
+    # a Provider registration.
     context = zmq.Context()
     dealer = context.socket(zmq.DEALER)
     dealer.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
@@ -1631,13 +1694,7 @@ def test_forwarded_packets_gain_exactly_one_hop(
     _assert_registration_ack(decode(sender.recv()), sender_registration)
 
     try:
-        request = Packet(
-            intent=PacketIntent.PING,
-            request=Request.PING,
-            source="hop-counting-sender",
-            destination=receiver,
-            hops=hops,
-        )
+        request = Packet(intent=intent, request=verb, source="hop-counting-sender", destination=receiver, hops=hops)
         sender.send(encode(request))
         _, data = dealer.recv_multipart()
         forwarded = decode(data)
@@ -1645,8 +1702,8 @@ def test_forwarded_packets_gain_exactly_one_hop(
         # The forwarded Packet is the request with one more hop, and nothing else changed.
         assert forwarded.id == request.id
         assert forwarded.hops == hops + 1
-        assert forwarded.intent == PacketIntent.PING
-        assert forwarded.request == Request.PING
+        assert forwarded.intent == intent
+        assert forwarded.request == verb
     finally:
         # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
         # context that outlives its socket can block the interpreter at exit in zmq term().
