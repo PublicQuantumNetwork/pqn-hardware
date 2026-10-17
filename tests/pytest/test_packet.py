@@ -1,5 +1,6 @@
 """Round-trip tests for the wire protocol models: every Payload model through JSON, and the envelope through encode/decode."""
 
+import datetime
 import json
 import re
 from enum import StrEnum
@@ -22,6 +23,8 @@ from pqn_hardware.network.packet import GetParameterPayload
 from pqn_hardware.network.packet import NetworkElementClass
 from pqn_hardware.network.packet import Packet
 from pqn_hardware.network.packet import PacketIntent
+from pqn_hardware.network.packet import ProvidersPayload
+from pqn_hardware.network.packet import ProviderSummary
 from pqn_hardware.network.packet import RegisterPayload
 from pqn_hardware.network.packet import Request
 from pqn_hardware.network.packet import SetParameterPayload
@@ -54,6 +57,28 @@ def round_trip_json(model: Any) -> Any:
 def test_register_payload_round_trip(kind: NetworkElementClass, devices: dict[str, DeviceSummary]) -> None:
     payload = RegisterPayload(kind=kind, devices=devices)
     assert round_trip_json(payload) == payload
+
+
+def test_registration_packet_carries_devices_only_for_providers() -> None:
+    # A Provider reports its devices in the REGISTER payload; a Client's REGISTER carries no
+    # devices key on the wire.
+    devices = {"dummy1": DeviceSummary(type="pqn_hardware.drivers.dummies.DummyInstrument", desc="d", hw_address="1")}
+    provider_packet = create_registration_packet(
+        source="provider1", destination="router1", kind=NetworkElementClass.PROVIDER, devices=devices
+    )
+    client_packet = create_registration_packet(
+        source="client1", destination="router1", kind=NetworkElementClass.CLIENT, devices=devices
+    )
+
+    assert RegisterPayload.model_validate(provider_packet.payload).devices == devices
+    wire = json.loads(encode(provider_packet))
+    assert wire["payload"]["devices"] == {
+        "dummy1": {"type": "pqn_hardware.drivers.dummies.DummyInstrument", "desc": "d", "hw_address": "1"}
+    }
+
+    # The Client never reports devices, even when the caller passes some.
+    assert RegisterPayload.model_validate(client_packet.payload).devices == {}
+    assert "devices" not in json.loads(encode(client_packet))["payload"]
 
 
 @given(instrument=st.text())
@@ -95,6 +120,28 @@ def test_value_payload_round_trip(value: Any) -> None:
 @given(devices=st.dictionaries(st.text(), device_summaries))
 def test_devices_payload_round_trip(devices: dict[str, DeviceSummary]) -> None:
     payload = DevicesPayload(devices=devices)
+    assert round_trip_json(payload) == payload
+
+
+provider_summaries = st.builds(
+    ProviderSummary,
+    name=st.text(),
+    last_seen=st.datetimes(timezones=st.just(datetime.UTC)),
+    devices=st.dictionaries(st.text(), device_summaries),
+)
+
+
+@given(provider_summary=provider_summaries)
+def test_provider_summary_round_trip(provider_summary: ProviderSummary) -> None:
+    # Last seen travels as an ISO 8601 string in UTC and comes back as the same datetime.
+    wire = json.loads(provider_summary.model_dump_json())["last_seen"]
+    assert datetime.datetime.fromisoformat(wire).utcoffset() == datetime.timedelta(0)
+    assert round_trip_json(provider_summary) == provider_summary
+
+
+@given(providers=st.lists(provider_summaries))
+def test_providers_payload_round_trip(providers: list[ProviderSummary]) -> None:
+    payload = ProvidersPayload(providers=providers)
     assert round_trip_json(payload) == payload
 
 

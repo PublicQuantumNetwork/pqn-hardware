@@ -1,5 +1,6 @@
 """Pydantic models for the JSON wire protocol (version 2)."""
 
+import datetime
 import uuid
 from enum import StrEnum
 from typing import Any
@@ -127,6 +128,20 @@ class DevicesPayload(BaseModel):
     devices: dict[str, DeviceSummary]
 
 
+class ProviderSummary(BaseModel):
+    """Summary of one Provider in the Router's Directory, by its Last seen time and devices."""
+
+    name: str
+    last_seen: datetime.datetime
+    devices: dict[str, DeviceSummary]
+
+
+class ProvidersPayload(BaseModel):
+    """Payload of a GET_PROVIDERS reply."""
+
+    providers: list[ProviderSummary]
+
+
 class ErrorPayload(BaseModel):
     """Payload of an ERROR Packet. The Origin is the element that raised the error."""
 
@@ -166,13 +181,29 @@ def decode(data: bytes) -> Packet:
     return packet
 
 
-def create_registration_packet(*, source: str, destination: str, kind: NetworkElementClass, hops: int = 0) -> Packet:
-    """Create the REGISTER Packet a network element sends to its Router."""
+def create_registration_packet(
+    *,
+    source: str,
+    destination: str,
+    kind: NetworkElementClass,
+    hops: int = 0,
+    devices: dict[str, DeviceSummary] | None = None,
+) -> Packet:
+    """Create the REGISTER Packet a network element sends to its Router.
+
+    Only Providers report devices, so a Client's REGISTER carries no
+    devices key on the wire.
+    """
+    payload = (
+        RegisterPayload(kind=kind, devices=devices or {})
+        if kind == NetworkElementClass.PROVIDER
+        else RegisterPayload(kind=kind)
+    )
     return Packet(
         intent=PacketIntent.REGISTRATION,
         request=Request.REGISTER,
         source=source,
         destination=destination,
         hops=hops,
-        payload=RegisterPayload(kind=kind).model_dump(exclude_unset=True),
+        payload=payload.model_dump(exclude_unset=True),
     )
