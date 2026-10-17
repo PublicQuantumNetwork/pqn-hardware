@@ -1170,6 +1170,21 @@ _trailing_nul_wire = (
     + b"\x00"
 )
 
+# A pretty-printed envelope without a version: not a decodable Packet, but its id is read
+# from the whole multi-line JSON object.
+_pretty_printed_wire = json.dumps(
+    {
+        "id": "pretty-printed-id",
+        "intent": "DATA",
+        "request": "GET_DEVICES",
+        "source": "json-envelope-client",
+        "destination": PROVIDER_NAME,
+        "hops": 0,
+        "payload": None,
+    },
+    indent=2,
+).encode("utf-8")
+
 
 @pytest.mark.parametrize(
     ("wire", "expected_reply_to"),
@@ -1183,6 +1198,8 @@ _trailing_nul_wire = (
         (b'{"Id": "abc"}', None),
         (b'{"id": "ab\xffc"}', None),
         (_trailing_nul_wire, None),
+        (_pretty_printed_wire, "pretty-printed-id"),
+        (b'[{"id": "x"}]', None),
     ],
     ids=[
         "json-array",
@@ -1194,16 +1211,20 @@ _trailing_nul_wire = (
         "mixed-case-id-key",
         "invalid-utf8-in-id",
         "trailing-nul-byte",
+        "pretty-printed-no-version",
+        "object-inside-a-json-array",
     ],
 )
 def test_json_that_is_not_a_usable_envelope_gets_malformed_packet(
     network_port: int, wire: bytes, expected_reply_to: str | None
 ) -> None:
     # Valid JSON that is not a usable envelope: a JSON array, a JSON object whose id is not
-    # a string, a bare JSON string, a JSON object with a reply_to but no id, or bytes that
-    # are not UTF-8 and so not JSON at all. The echoed reply_to is the id when the data is a
-    # JSON object with a string id under exactly that key: any other key, case or no id
-    # at all gives a null reply_to. A follow-up request on the same socket is still answered.
+    # a string, a bare JSON string, a JSON object with a reply_to but no id, a JSON object
+    # nested inside a JSON array, or bytes that are not UTF-8 and so not JSON at all. The
+    # echoed reply_to is the id when the data is a JSON object with a string id under
+    # exactly that key, read from the whole message however it is formatted: any other
+    # key, case or no id at all gives a null reply_to. A follow-up request on the same
+    # socket is still answered.
     context = zmq.Context()
     socket = context.socket(zmq.REQ)
     socket.setsockopt(zmq.REQ_RELAXED, 1)
@@ -1563,27 +1584,29 @@ def test_destination_names_are_matched_exactly(network_port: int, destination: s
 
 
 @pytest.mark.parametrize(
-    "receiver_kind",
-    [NetworkElementClass.PROVIDER, NetworkElementClass.CLIENT],
+    ("receiver_kind", "receiver"),
+    [
+        (NetworkElementClass.PROVIDER, "hop-counting-provider"),
+        (NetworkElementClass.CLIENT, "hop-counting-client"),
+    ],
     ids=["receiver-provider", "receiver-client"],
 )
 @pytest.mark.parametrize("hops", [0, 100], ids=["small-hop-count", "large-hop-count"])
 def test_forwarded_packets_gain_exactly_one_hop(
-    network_port: int, hops: int, receiver_kind: NetworkElementClass
+    network_port: int, hops: int, receiver_kind: NetworkElementClass, receiver: str
 ) -> None:
     # The Router forwards a Packet with exactly one more hop, whatever its hop count and
     # whoever the registered receiver is: there is no limit on
     # hops, and a Client is a forwardable destination like a Provider. A Dealer standing in
-    # for the registered receiver receives the forwarded Packet.
+    # for the registered receiver receives the forwarded Packet. The receiver's name is
+    # unique to its kind, so the Client case can never ride on a Provider registration.
     context = zmq.Context()
     dealer = context.socket(zmq.DEALER)
     dealer.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
-    dealer.setsockopt_string(zmq.IDENTITY, "hop-counting-receiver")
+    dealer.setsockopt_string(zmq.IDENTITY, receiver)
     dealer.connect(f"tcp://{HOST}:{network_port}")
 
-    registration = create_registration_packet(
-        source="hop-counting-receiver", destination=ROUTER_NAME, kind=receiver_kind
-    )
+    registration = create_registration_packet(source=receiver, destination=ROUTER_NAME, kind=receiver_kind)
     dealer.send(encode(registration))
     _, ack_data = dealer.recv_multipart()
     _assert_registration_ack(decode(ack_data), registration)
@@ -1603,7 +1626,7 @@ def test_forwarded_packets_gain_exactly_one_hop(
             intent=PacketIntent.PING,
             request=Request.PING,
             source="hop-counting-sender",
-            destination="hop-counting-receiver",
+            destination=receiver,
             hops=hops,
         )
         sender.send(encode(request))
@@ -1623,11 +1646,13 @@ def test_forwarded_packets_gain_exactly_one_hop(
         context.term()
 
 
+@pytest.mark.parametrize("hops", [0, 1], ids=["hops-0", "hops-1"])
 def test_error_packet_addressed_to_the_router_is_never_answered(
-    network_port: int, caplog: pytest.LogCaptureFixture
+    network_port: int, caplog: pytest.LogCaptureFixture, hops: int
 ) -> None:
-    # An ERROR Packet is itself a reply and is never answered, so errors cannot bounce forever:
-    # the Router logs a warning, the sender gets no reply, and the Router keeps serving.
+    # An ERROR Packet is itself a reply and is never answered, so errors cannot bounce forever,
+    # whatever its hop count: the Router logs a warning, the sender gets no reply, and
+    # the Router keeps serving.
     context = zmq.Context()
     socket = context.socket(zmq.REQ)
     socket.setsockopt(zmq.REQ_RELAXED, 1)
@@ -1648,6 +1673,7 @@ def test_error_packet_addressed_to_the_router_is_never_answered(
             request=Request.ERROR,
             source="error-sender-client",
             destination=ROUTER_NAME,
+            hops=hops,
             payload=ErrorPayload(
                 code=ErrorCode.INSTRUMENT_ERROR, message="an error the Router never asked for", origin="error-sender"
             ).model_dump(),
@@ -1662,6 +1688,50 @@ def test_error_packet_addressed_to_the_router_is_never_answered(
         # The Router keeps serving after dropping the ERROR Packet.
         ping = Packet(
             intent=PacketIntent.PING, request=Request.PING, source="error-sender-client", destination=PROVIDER_NAME
+        )
+        socket.send(encode(ping))
+        pong = decode(socket.recv())
+        assert pong.request == Request.PONG
+        assert pong.reply_to == ping.id
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        socket.close()
+        context.term()
+
+
+def test_data_packet_addressed_to_the_router_is_dropped_not_answered(network_port: int) -> None:
+    # A DATA Packet addressed to the Router is dropped with a log line. Whatever the Intent, the Router
+    # never answers a Packet addressed to itself with an error naming itself as the
+    # destination: the sender gets no reply at all.
+    context = zmq.Context()
+    socket = context.socket(zmq.REQ)
+    socket.setsockopt(zmq.REQ_RELAXED, 1)
+    socket.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+    socket.setsockopt_string(zmq.IDENTITY, "data-to-router-client")
+    socket.connect(f"tcp://{HOST}:{network_port}")
+
+    registration = create_registration_packet(
+        source="data-to-router-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
+    )
+    socket.send(encode(registration))
+    registration_ack = decode(socket.recv())
+    _assert_registration_ack(registration_ack, registration)
+
+    try:
+        request = Packet(
+            intent=PacketIntent.DATA,
+            request=Request.GET_PROVIDERS,
+            source="data-to-router-client",
+            destination=ROUTER_NAME,
+        )
+        socket.send(encode(request))
+        with pytest.raises(zmq.error.Again):
+            socket.recv()
+
+        # The Router keeps serving after dropping the DATA Packet.
+        ping = Packet(
+            intent=PacketIntent.PING, request=Request.PING, source="data-to-router-client", destination=PROVIDER_NAME
         )
         socket.send(encode(ping))
         pong = decode(socket.recv())
