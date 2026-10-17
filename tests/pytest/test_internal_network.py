@@ -1162,12 +1162,15 @@ def test_wrong_version_packets_are_refused_never_handled(network_port: int) -> N
 
 
 @pytest.mark.parametrize(
-    "wire", [b"[1, 2, 3]", b'{"id": 42}', b'"abc"'], ids=["json-array", "id-not-a-string", "json-string"]
+    "wire",
+    [b"[1, 2, 3]", b'{"id": 42}', b'"abc"', b'{"reply_to": "abc", "intent": 5}'],
+    ids=["json-array", "id-not-a-string", "json-string", "reply-to-but-no-id"],
 )
 def test_json_that_is_not_a_usable_envelope_gets_malformed_packet(network_port: int, wire: bytes) -> None:
     # Valid JSON that is not a usable envelope: a JSON array, a JSON object whose id is not
-    # a string, or a bare JSON string. There is no readable id, so the error reply carries a
-    # null reply_to, and a follow-up request on the same socket is still answered.
+    # a string, a bare JSON string, or a JSON object with a reply_to but no id (the echoed
+    # reply_to is the id or nothing). There is no readable id, so the error reply carries
+    # a null reply_to, and a follow-up request on the same socket is still answered.
     context = zmq.Context()
     socket = context.socket(zmq.REQ)
     socket.setsockopt(zmq.REQ_RELAXED, 1)
@@ -1208,11 +1211,14 @@ def test_json_that_is_not_a_usable_envelope_gets_malformed_packet(network_port: 
         context.term()
 
 
+@pytest.mark.parametrize("hops", [0, 1], ids=["hops-0", "hops-1"])
 @pytest.mark.parametrize("version", [1, 3], ids=["older-version", "newer-version"])
-def test_unsupported_version_register_gets_unsupported_version_error(network_port: int, version: int) -> None:
+def test_unsupported_version_register_gets_unsupported_version_error(
+    network_port: int, version: int, hops: int
+) -> None:
     # The version is enforced on REGISTER too, as an exact match: a REGISTER in
-    # any other version, older or newer, never gets a REGISTRATION_ACK, and a following v2
-    # REGISTER still gets its own acknowledgement.
+    # any other version, older or newer, whatever its hop count, never gets a
+    # REGISTRATION_ACK, and a following v2 REGISTER still gets its own acknowledgement.
     context = zmq.Context()
     socket = context.socket(zmq.REQ)
     socket.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
@@ -1226,6 +1232,7 @@ def test_unsupported_version_register_gets_unsupported_version_error(network_por
         )
         wire = json.loads(encode(request))
         wire["version"] = version
+        wire["hops"] = hops
         socket.send(json.dumps(wire).encode("utf-8"))
         reply = decode(socket.recv())
 
@@ -1250,11 +1257,12 @@ def test_unsupported_version_register_gets_unsupported_version_error(network_por
         context.term()
 
 
+@pytest.mark.parametrize("hops", [0, 1], ids=["hops-0", "hops-1"])
 @pytest.mark.parametrize("version", [1, 3], ids=["older-version", "newer-version"])
-def test_unsupported_version_gets_unsupported_version_error(network_port: int, version: int) -> None:
-    # A version this Router does not speak, older or newer (an exact match), gets
-    # a fast UNSUPPORTED_VERSION reply whose details carry the expected and received versions,
-    # and the Router keeps serving afterwards.
+def test_unsupported_version_gets_unsupported_version_error(network_port: int, version: int, hops: int) -> None:
+    # A version this Router does not speak, older or newer, whatever the hop count (an exact
+    # match), gets a fast UNSUPPORTED_VERSION reply whose details carry the
+    # expected and received versions, and the Router keeps serving afterwards.
     context = zmq.Context()
     socket = context.socket(zmq.REQ)
     socket.setsockopt(zmq.REQ_RELAXED, 1)
@@ -1277,6 +1285,7 @@ def test_unsupported_version_gets_unsupported_version_error(network_port: int, v
         )
         wire = json.loads(encode(request))
         wire["version"] = version
+        wire["hops"] = hops
         socket.send(json.dumps(wire).encode("utf-8"))
         reply = decode(socket.recv())
 
@@ -1403,12 +1412,26 @@ def test_invalid_registration_payload_gets_malformed_packet(network_port: int) -
 
 def test_unknown_destination_error_lists_registered_providers(network_port: int) -> None:
     # The UNKNOWN_DESTINATION reply lists the Providers registered with the Router,
-    # so the message says what went wrong instead of "Routing not implemented yet."
+    # every one of them, so the message says what went wrong instead of "Routing not
+    # implemented yet."
     context = zmq.Context()
     socket = context.socket(zmq.REQ)
     socket.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
     socket.setsockopt_string(zmq.IDENTITY, "lost-client")
     socket.connect(f"tcp://{HOST}:{network_port}")
+
+    # A second Provider registers with the Router: announcing itself is enough, no real
+    # Provider needs to be behind it.
+    dealer = context.socket(zmq.DEALER)
+    dealer.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+    dealer.setsockopt_string(zmq.IDENTITY, "second-provider")
+    dealer.connect(f"tcp://{HOST}:{network_port}")
+    second_registration = create_registration_packet(
+        source="second-provider", destination=ROUTER_NAME, kind=NetworkElementClass.PROVIDER
+    )
+    dealer.send(encode(second_registration))
+    _, ack_data = dealer.recv_multipart()
+    _assert_registration_ack(decode(ack_data), second_registration)
 
     registration = create_registration_packet(
         source="lost-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
@@ -1427,6 +1450,37 @@ def test_unknown_destination_error_lists_registered_providers(network_port: int)
         payload = _assert_error_reply(reply, request, ErrorCode.UNKNOWN_DESTINATION, ROUTER_NAME)
         assert f"Destination 'no-such-provider' is not registered with {ROUTER_NAME}" in payload.message
         assert PROVIDER_NAME in payload.message
+        assert "second-provider" in payload.message
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        socket.close()
+        dealer.close()
+        context.term()
+
+
+def test_destination_names_are_matched_case_sensitively(network_port: int) -> None:
+    # A Packet addressed to the Router's name in a different case is not addressed to the
+    # Router: names are matched exactly, so the upper-cased name is an ordinary unknown
+    # destination and gets a fast UNKNOWN_DESTINATION instead of a silent drop.
+    context = zmq.Context()
+    socket = context.socket(zmq.REQ)
+    socket.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+    socket.setsockopt_string(zmq.IDENTITY, "upper-case-client")
+    socket.connect(f"tcp://{HOST}:{network_port}")
+
+    try:
+        request = Packet(
+            intent=PacketIntent.PING,
+            request=Request.PING,
+            source="upper-case-client",
+            destination=ROUTER_NAME.upper(),
+        )
+        socket.send(encode(request))
+        reply = decode(socket.recv())
+
+        payload = _assert_error_reply(reply, request, ErrorCode.UNKNOWN_DESTINATION, ROUTER_NAME)
+        assert f"Destination '{ROUTER_NAME.upper()}' is not registered with {ROUTER_NAME}" in payload.message
     finally:
         # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
         # context that outlives its socket can block the interpreter at exit in zmq term().
