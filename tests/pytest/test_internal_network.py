@@ -10,6 +10,7 @@ import re
 import socket
 import threading
 import time
+from collections.abc import Callable
 from collections.abc import Generator
 from dataclasses import dataclass
 from pathlib import Path
@@ -86,7 +87,9 @@ def _stop_router(router: Router) -> None:
         poker.send(b"stop")
         _wait_until(lambda: router.socket is not None and router.socket.closed, 10, "Router did not stop.")
     finally:
-        poker.close()
+        # The poke is discarded if the Router is already gone: waiting for it to transfer
+        # would hang the teardown.
+        poker.close(linger=0)
         context.term()
 
 
@@ -2103,8 +2106,11 @@ def test_a_peer_at_its_high_water_mark_gets_destination_unreachable_and_the_rout
     # sends never block (zmq.DONTWAIT in _send), so a Packet to the stuck Provider raises
     # instead of freezing the Router: the sender gets DESTINATION_UNREACHABLE with the
     # Provider's Last seen, and the Router keeps serving right after.
+    # The transport heartbeats are off: tearing a Router down while a heartbeat engine talks
+    # to a full, unread peer trips a libzmq assertion (stream_engine_base.cpp), and the
+    # heartbeat path is not what this test exercises.
     port = _free_port()
-    router = Router(ROUTER_NAME, HOST, port)
+    router = Router(ROUTER_NAME, HOST, port, heartbeat_ivl=0)
     threading.Thread(target=router.start, daemon=True).start()
     _wait_until(lambda: router.running, 10, "Router did not start.")
 
@@ -2233,6 +2239,173 @@ def test_start_router_options_reach_the_router(monkeypatch: pytest.MonkeyPatch) 
     start_router(name="cli-router", heartbeat_ivl=250, heartbeat_timeout=750)
 
     assert started == [{"name": "cli-router", "heartbeat_ivl": 250, "heartbeat_timeout": 750}]
+
+
+def _flood_until_dropped(flood: zmq.Socket[bytes], flood_packet: Packet, dropped: Callable[[], bool]) -> None:
+    """Flood requests the Router replies to until it drops one of the replies with a warning.
+
+    The flood is bounded: the Router's send queue to a peer that never reads fills well within
+    the bound, and a Router that never drops a reply fails the test instead of hanging it.
+    """
+    flood_batch = 500
+    flood_batches = 20
+    for _ in range(flood_batches):
+        for _ in range(flood_batch):
+            flood.send(encode(flood_packet))
+        if dropped():
+            return
+    msg = "the flood peer's pipe never filled; the Router's replies were never dropped"
+    raise AssertionError(msg)
+
+
+def test_a_peer_that_stops_reading_cannot_crash_the_router(caplog: pytest.LogCaptureFixture) -> None:
+    # A peer that stops reading fills the Router's send queue with replies to it. The
+    # Router's own replies, and separately its error replies, are then dropped with a
+    # warning instead of blocking or crashing the Router: the Router never freezes on one
+    # peer, and a second peer's PING still gets its PONG.
+    # The transport heartbeats are off: tearing a Router down while a heartbeat engine talks
+    # to a full, unread peer trips a libzmq assertion (stream_engine_base.cpp), and the
+    # heartbeat path is not what this test exercises.
+    port = _free_port()
+    router = Router(ROUTER_NAME, HOST, port, heartbeat_ivl=0)
+    router_thread = threading.Thread(target=router.start, daemon=True)
+    router_thread.start()
+    _wait_until(lambda: router.running, 10, "Router did not start.")
+
+    context = zmq.Context()
+    # A stand-in Provider with a large device description: the Directory, and so every
+    # GET_PROVIDERS reply to the flood peer, is large, so the peer's pipe fills within the
+    # flood bound below.
+    stand_in = context.socket(zmq.DEALER)
+    stand_in.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+    stand_in.setsockopt_string(zmq.IDENTITY, "big-directory-provider")
+    stand_in.connect(f"tcp://{HOST}:{port}")
+    stand_in_registration = create_registration_packet(
+        source="big-directory-provider",
+        destination=ROUTER_NAME,
+        kind=NetworkElementClass.PROVIDER,
+        devices={"device-big": DeviceSummary(type="property.Driver", desc="x" * 10_000, hw_address="1")},
+    )
+    stand_in.send(encode(stand_in_registration))
+    _, ack_data = stand_in.recv_multipart()
+    _assert_registration_ack(decode(ack_data), stand_in_registration)
+
+    # The flood peer: a receive high-water mark of one message and no reads at all, so the
+    # Router's replies to it cannot be queued for long. Its own send high-water mark holds
+    # the whole flood, so the flood never blocks even if the Router stops reading it.
+    flood = context.socket(zmq.DEALER)
+    flood.setsockopt(zmq.RCVHWM, 1)
+    flood.setsockopt(zmq.SNDHWM, 20_000)
+    flood.setsockopt_string(zmq.IDENTITY, "non-reading-client")
+    flood.connect(f"tcp://{HOST}:{port}")
+
+    # A second peer that reads, to prove the Router keeps serving throughout.
+    reader = context.socket(zmq.REQ)
+    reader.setsockopt(zmq.REQ_RELAXED, 1)
+    reader.setsockopt(zmq.REQ_CORRELATE, 1)
+    reader.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+    reader.setsockopt_string(zmq.IDENTITY, "reading-client")
+    reader.connect(f"tcp://{HOST}:{port}")
+    reader_registration = create_registration_packet(
+        source="reading-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
+    )
+    reader.send(encode(reader_registration))
+    _assert_registration_ack(decode(reader.recv()), reader_registration)
+
+    get_providers = Packet(
+        intent=PacketIntent.DATA, request=Request.GET_PROVIDERS, source="non-reading-client", destination=ROUTER_NAME
+    )
+    try:
+        with caplog.at_level(logging.WARNING, logger="pqn_hardware.network.router"):
+            # The Router's own replies to the flood peer are dropped with a warning: the
+            # GET_PROVIDERS replies it cannot queue anymore.
+            _flood_until_dropped(
+                flood,
+                get_providers,
+                lambda: any("Could not send a reply" in record.message for record in caplog.records),
+            )
+
+            # The Router's error replies to the flood peer are dropped too, with their own
+            # warning: bytes the Router answers with a MALFORMED_PACKET error reply. The
+            # bytes queue behind the flood's leftover requests, so the wait is generous:
+            # under load the Router chews through the backlog for seconds before it reaches
+            # them.
+            for _ in range(5):
+                flood.send(b"\x80\x04 not valid JSON")
+            _wait_until(
+                lambda: any("Could not send the error reply" in record.message for record in caplog.records),
+                10,
+                "the Router never dropped an error reply to the full peer",
+            )
+
+        # The Router kept serving throughout: the reading peer's PING still gets its PONG.
+        ping = Packet(intent=PacketIntent.PING, request=Request.PING, source="reading-client", destination=ROUTER_NAME)
+        reader.send(encode(ping))
+        pong = decode(reader.recv())
+        assert pong.request == Request.PONG
+        assert pong.source == ROUTER_NAME
+        assert pong.reply_to == ping.id
+        # The Router's own thread survived every dropped reply: nothing the unread peer did
+        # could crash the Router.
+        assert router_thread.is_alive()
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        # The sockets close with no linger: a flood peer can still hold undelivered messages,
+        # and waiting for them to transfer would hang the teardown.
+        reader.close(linger=0)
+        flood.close(linger=0)
+        stand_in.close(linger=0)
+        context.term()
+        _stop_router(router)
+
+
+def test_get_providers_lists_every_registered_provider() -> None:
+    # The Directory holds a single record per registered Provider, so GET_PROVIDERS lists
+    # every registered Provider, each with the devices it reported at registration.
+    port = _free_port()
+    router = Router(ROUTER_NAME, HOST, port)
+    threading.Thread(target=router.start, daemon=True).start()
+    _wait_until(lambda: router.running, 10, "Router did not start.")
+
+    context = zmq.Context()
+    devices_by_provider = {
+        "first-provider": {
+            "device-a": DeviceSummary(type="pqn.First", desc="the first provider's device", hw_address="1")
+        },
+        "second-provider": {
+            "device-b": DeviceSummary(type="pqn.Second", desc="the second provider's device", hw_address="2")
+        },
+    }
+    stand_ins = []
+    for name, devices in devices_by_provider.items():
+        stand_in = context.socket(zmq.DEALER)
+        stand_in.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+        stand_in.setsockopt_string(zmq.IDENTITY, name)
+        stand_in.connect(f"tcp://{HOST}:{port}")
+        registration = create_registration_packet(
+            source=name, destination=ROUTER_NAME, kind=NetworkElementClass.PROVIDER, devices=devices
+        )
+        stand_in.send(encode(registration))
+        _, ack_data = stand_in.recv_multipart()
+        _assert_registration_ack(decode(ack_data), registration)
+        stand_ins.append(stand_in)
+
+    client = Client(host=HOST, port=port, router_name=ROUTER_NAME, timeout=10_000)
+    try:
+        providers = client.get_providers()
+
+        assert set(providers) == set(devices_by_provider)
+        for name, devices in devices_by_provider.items():
+            assert providers[name].devices == devices
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        client.disconnect()
+        for stand_in in stand_ins:
+            stand_in.close()
+        context.term()
+        _stop_router(router)
 
 
 @pytest.mark.parametrize("hops", [0, 1], ids=["hops-0", "hops-1"])
