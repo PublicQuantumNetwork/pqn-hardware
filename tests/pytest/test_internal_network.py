@@ -1161,6 +1161,16 @@ def test_wrong_version_packets_are_refused_never_handled(network_port: int) -> N
         context.term()
 
 
+# A valid envelope followed by a NUL byte: not valid JSON (extra data), so there is no
+# readable id.
+_trailing_nul_wire = (
+    encode(
+        Packet(intent=PacketIntent.PING, request=Request.PING, source="json-envelope-client", destination=PROVIDER_NAME)
+    )
+    + b"\x00"
+)
+
+
 @pytest.mark.parametrize(
     ("wire", "expected_reply_to"),
     [
@@ -1172,6 +1182,7 @@ def test_wrong_version_packets_are_refused_never_handled(network_port: int) -> N
         (b'{"ID": "abc"}', None),
         (b'{"Id": "abc"}', None),
         (b'{"id": "ab\xffc"}', None),
+        (_trailing_nul_wire, None),
     ],
     ids=[
         "json-array",
@@ -1182,6 +1193,7 @@ def test_wrong_version_packets_are_refused_never_handled(network_port: int) -> N
         "upper-case-id-key",
         "mixed-case-id-key",
         "invalid-utf8-in-id",
+        "trailing-nul-byte",
     ],
 )
 def test_json_that_is_not_a_usable_envelope_gets_malformed_packet(
@@ -1225,6 +1237,41 @@ def test_json_that_is_not_a_usable_envelope_gets_malformed_packet(
         pong = decode(socket.recv())
         assert pong.request == Request.PONG
         assert pong.reply_to == ping.id
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        socket.close()
+        context.term()
+
+
+def test_a_large_undecodable_packet_keeps_its_readable_id(network_port: int) -> None:
+    # The id is read from the whole undecodable message, however large it is: a JSON object
+    # well over 64 KiB with a string id and no version gets MALFORMED_PACKET echoing that id.
+    context = zmq.Context()
+    socket = context.socket(zmq.REQ)
+    socket.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+    socket.setsockopt_string(zmq.IDENTITY, "large-packet-client")
+    socket.connect(f"tcp://{HOST}:{network_port}")
+
+    try:
+        packet_id = "large-undecodable-packet-id"
+        wire = {
+            "id": packet_id,
+            "intent": "DATA",
+            "request": "GET_DEVICES",
+            "source": "large-packet-client",
+            "destination": PROVIDER_NAME,
+            "hops": 0,
+            "payload": {"padding": "x" * 70_000},
+        }
+        socket.send(json.dumps(wire).encode("utf-8"))
+        reply = decode(socket.recv())
+
+        assert reply.intent == PacketIntent.ERROR
+        assert reply.reply_to == packet_id
+        payload = ErrorPayload.model_validate(reply.payload)
+        assert payload.code == ErrorCode.MALFORMED_PACKET
+        assert payload.origin == ROUTER_NAME
     finally:
         # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
         # context that outlives its socket can block the interpreter at exit in zmq term().
@@ -1433,75 +1480,81 @@ def test_invalid_registration_payload_gets_malformed_packet(network_port: int) -
 
 def test_unknown_destination_error_lists_registered_providers(network_port: int) -> None:
     # The UNKNOWN_DESTINATION reply lists the Providers registered with the Router,
-    # every one of them, so the message says what went wrong instead of "Routing not
-    # implemented yet."
+    # every one of them, including the one that sent the Packet, so the message says
+    # what went wrong instead of "Routing not implemented yet."
     context = zmq.Context()
-    socket = context.socket(zmq.REQ)
-    socket.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
-    socket.setsockopt_string(zmq.IDENTITY, "lost-client")
-    socket.connect(f"tcp://{HOST}:{network_port}")
-
-    # A second Provider registers with the Router: announcing itself is enough, no real
-    # Provider needs to be behind it.
     dealer = context.socket(zmq.DEALER)
     dealer.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
     dealer.setsockopt_string(zmq.IDENTITY, "second-provider")
     dealer.connect(f"tcp://{HOST}:{network_port}")
-    second_registration = create_registration_packet(
+
+    # A second Provider registers with the Router: announcing itself is enough, no real
+    # Provider needs to be behind it.
+    registration = create_registration_packet(
         source="second-provider", destination=ROUTER_NAME, kind=NetworkElementClass.PROVIDER
     )
-    dealer.send(encode(second_registration))
+    dealer.send(encode(registration))
     _, ack_data = dealer.recv_multipart()
-    _assert_registration_ack(decode(ack_data), second_registration)
-
-    registration = create_registration_packet(
-        source="lost-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
-    )
-    socket.send(encode(registration))
-    registration_ack = decode(socket.recv())
-    _assert_registration_ack(registration_ack, registration)
+    _assert_registration_ack(decode(ack_data), registration)
 
     try:
+        # The registered Provider itself asks for an unknown destination.
         request = Packet(
-            intent=PacketIntent.DATA, request=Request.GET_DEVICES, source="lost-client", destination="no-such-provider"
+            intent=PacketIntent.DATA,
+            request=Request.GET_DEVICES,
+            source="second-provider",
+            destination="no-such-provider",
         )
-        socket.send(encode(request))
-        reply = decode(socket.recv())
+        dealer.send(encode(request))
+        _, error_data = dealer.recv_multipart()
+        reply = decode(error_data)
 
         payload = _assert_error_reply(reply, request, ErrorCode.UNKNOWN_DESTINATION, ROUTER_NAME)
         assert f"Destination 'no-such-provider' is not registered with {ROUTER_NAME}" in payload.message
+        # Both registered Providers are listed, the sender's own name included.
         assert PROVIDER_NAME in payload.message
         assert "second-provider" in payload.message
     finally:
         # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
         # context that outlives its socket can block the interpreter at exit in zmq term().
-        socket.close()
         dealer.close()
         context.term()
 
 
-def test_destination_names_are_matched_case_sensitively(network_port: int) -> None:
-    # A Packet addressed to the Router's name in a different case is not addressed to the
-    # Router: names are matched exactly, so the upper-cased name is an ordinary unknown
-    # destination and gets a fast UNKNOWN_DESTINATION instead of a silent drop.
+@pytest.mark.parametrize(
+    "destination",
+    [ROUTER_NAME.upper(), "", f"{ROUTER_NAME} "],
+    ids=["upper-case", "empty", "trailing-space"],
+)
+def test_destination_names_are_matched_exactly(network_port: int, destination: str) -> None:
+    # A Packet addressed to anything but the Router's exact name is not addressed to the
+    # Router: the name upper-cased, empty, or with trailing whitespace is an ordinary
+    # unknown destination and gets a fast UNKNOWN_DESTINATION instead of a silent drop.
     context = zmq.Context()
     socket = context.socket(zmq.REQ)
     socket.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
-    socket.setsockopt_string(zmq.IDENTITY, "upper-case-client")
+    socket.setsockopt_string(zmq.IDENTITY, "exact-name-client")
     socket.connect(f"tcp://{HOST}:{network_port}")
 
     try:
         request = Packet(
             intent=PacketIntent.PING,
             request=Request.PING,
-            source="upper-case-client",
-            destination=ROUTER_NAME.upper(),
+            source="exact-name-client",
+            destination=destination,
         )
         socket.send(encode(request))
-        reply = decode(socket.recv())
+        raw_reply = socket.recv()
+        reply = decode(raw_reply)
 
         payload = _assert_error_reply(reply, request, ErrorCode.UNKNOWN_DESTINATION, ROUTER_NAME)
-        assert f"Destination '{ROUTER_NAME.upper()}' is not registered with {ROUTER_NAME}" in payload.message
+        assert f"Destination '{destination}' is not registered with {ROUTER_NAME}" in payload.message
+
+        # On the wire, the error Payload carries its code, message, origin and details keys,
+        # details as an empty object when there is nothing to report.
+        wire_payload = json.loads(raw_reply)["payload"]
+        assert set(wire_payload) == {"code", "message", "origin", "details"}
+        assert wire_payload["details"] == {}
     finally:
         # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
         # context that outlives its socket can block the interpreter at exit in zmq term().
@@ -1509,18 +1562,27 @@ def test_destination_names_are_matched_case_sensitively(network_port: int) -> No
         context.term()
 
 
+@pytest.mark.parametrize(
+    "receiver_kind",
+    [NetworkElementClass.PROVIDER, NetworkElementClass.CLIENT],
+    ids=["receiver-provider", "receiver-client"],
+)
 @pytest.mark.parametrize("hops", [0, 100], ids=["small-hop-count", "large-hop-count"])
-def test_forwarded_packets_gain_exactly_one_hop(network_port: int, hops: int) -> None:
-    # The Router forwards a Packet with exactly one more hop, whatever its hop count: there is
-    # no limit on hops, so a large hop count is forwarded like any other. A Dealer standing in for the registered Provider receives the forwarded Packet.
+def test_forwarded_packets_gain_exactly_one_hop(
+    network_port: int, hops: int, receiver_kind: NetworkElementClass
+) -> None:
+    # The Router forwards a Packet with exactly one more hop, whatever its hop count and
+    # whoever the registered receiver is: there is no limit on
+    # hops, and a Client is a forwardable destination like a Provider. A Dealer standing in
+    # for the registered receiver receives the forwarded Packet.
     context = zmq.Context()
     dealer = context.socket(zmq.DEALER)
     dealer.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
-    dealer.setsockopt_string(zmq.IDENTITY, "hop-counting-provider")
+    dealer.setsockopt_string(zmq.IDENTITY, "hop-counting-receiver")
     dealer.connect(f"tcp://{HOST}:{network_port}")
 
     registration = create_registration_packet(
-        source="hop-counting-provider", destination=ROUTER_NAME, kind=NetworkElementClass.PROVIDER
+        source="hop-counting-receiver", destination=ROUTER_NAME, kind=receiver_kind
     )
     dealer.send(encode(registration))
     _, ack_data = dealer.recv_multipart()
@@ -1541,7 +1603,7 @@ def test_forwarded_packets_gain_exactly_one_hop(network_port: int, hops: int) ->
             intent=PacketIntent.PING,
             request=Request.PING,
             source="hop-counting-sender",
-            destination="hop-counting-provider",
+            destination="hop-counting-receiver",
             hops=hops,
         )
         sender.send(encode(request))
