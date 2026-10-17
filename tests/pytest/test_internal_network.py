@@ -1200,6 +1200,7 @@ _pretty_printed_wire = json.dumps(
         (_trailing_nul_wire, None),
         (_pretty_printed_wire, "pretty-printed-id"),
         (b'[{"id": "x"}]', None),
+        (b'\x00{"id": "x"}', None),
     ],
     ids=[
         "json-array",
@@ -1213,6 +1214,7 @@ _pretty_printed_wire = json.dumps(
         "trailing-nul-byte",
         "pretty-printed-no-version",
         "object-inside-a-json-array",
+        "leading-nul-byte",
     ],
 )
 def test_json_that_is_not_a_usable_envelope_gets_malformed_packet(
@@ -1450,9 +1452,15 @@ def test_missing_version_gets_malformed_packet(network_port: int) -> None:
         context.term()
 
 
-def test_invalid_registration_payload_gets_malformed_packet(network_port: int) -> None:
+@pytest.mark.parametrize(
+    "payload",
+    [{"kind": "NOT_A_KIND"}, None],
+    ids=["invalid-kind", "null-payload"],
+)
+def test_invalid_registration_payload_gets_malformed_packet(network_port: int, payload: dict[str, Any] | None) -> None:
     # An invalid REGISTER Payload gets a fast MALFORMED_PACKET reply instead of crashing the
-    # Router, and the Router keeps serving afterwards.
+    # Router or being dropped, and the Router keeps serving afterwards. A null Payload is
+    # just as invalid: a REGISTER carries a RegisterPayload.
     context = zmq.Context()
     socket = context.socket(zmq.REQ)
     socket.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
@@ -1473,7 +1481,7 @@ def test_invalid_registration_payload_gets_malformed_packet(network_port: int) -
             request=Request.REGISTER,
             source="bad-register-client",
             destination=ROUTER_NAME,
-            payload={"kind": "NOT_A_KIND"},
+            payload=payload,
         )
         socket.send(encode(request))
         reply = decode(socket.recv())
@@ -1544,13 +1552,14 @@ def test_unknown_destination_error_lists_registered_providers(network_port: int)
 
 @pytest.mark.parametrize(
     "destination",
-    [ROUTER_NAME.upper(), "", f"{ROUTER_NAME} "],
-    ids=["upper-case", "empty", "trailing-space"],
+    [ROUTER_NAME.upper(), "", f"{ROUTER_NAME} ", "*"],
+    ids=["upper-case", "empty", "trailing-space", "wildcard"],
 )
 def test_destination_names_are_matched_exactly(network_port: int, destination: str) -> None:
     # A Packet addressed to anything but the Router's exact name is not addressed to the
-    # Router: the name upper-cased, empty, or with trailing whitespace is an ordinary
-    # unknown destination and gets a fast UNKNOWN_DESTINATION instead of a silent drop.
+    # Router: the name upper-cased, empty, with trailing whitespace, or a wildcard is an
+    # ordinary unknown destination and gets a fast UNKNOWN_DESTINATION instead of a silent
+    # drop.
     context = zmq.Context()
     socket = context.socket(zmq.REQ)
     socket.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
@@ -1646,6 +1655,57 @@ def test_forwarded_packets_gain_exactly_one_hop(
         context.term()
 
 
+def test_a_large_packet_is_forwarded_intact(network_port: int) -> None:
+    # A valid Packet is forwarded intact however large it is: a Payload over 64 KiB arrives
+    # unchanged, with exactly one more hop. A Dealer standing in for the registered receiver
+    # receives the forwarded Packet.
+    context = zmq.Context()
+    dealer = context.socket(zmq.DEALER)
+    dealer.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+    dealer.setsockopt_string(zmq.IDENTITY, "large-payload-receiver")
+    dealer.connect(f"tcp://{HOST}:{network_port}")
+
+    registration = create_registration_packet(
+        source="large-payload-receiver", destination=ROUTER_NAME, kind=NetworkElementClass.PROVIDER
+    )
+    dealer.send(encode(registration))
+    _, ack_data = dealer.recv_multipart()
+    _assert_registration_ack(decode(ack_data), registration)
+
+    sender = context.socket(zmq.REQ)
+    sender.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+    sender.setsockopt_string(zmq.IDENTITY, "large-payload-sender")
+    sender.connect(f"tcp://{HOST}:{network_port}")
+    sender_registration = create_registration_packet(
+        source="large-payload-sender", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
+    )
+    sender.send(encode(sender_registration))
+    _assert_registration_ack(decode(sender.recv()), sender_registration)
+
+    try:
+        request = Packet(
+            intent=PacketIntent.DATA,
+            request=Request.GET_DEVICE_STRUCTURE,
+            source="large-payload-sender",
+            destination="large-payload-receiver",
+            payload={"padding": "x" * 100_000},
+        )
+        sender.send(encode(request))
+        _, data = dealer.recv_multipart()
+        forwarded = decode(data)
+
+        # The whole large Packet is forwarded, its Payload unchanged, with one more hop.
+        assert forwarded.id == request.id
+        assert forwarded.hops == request.hops + 1
+        assert forwarded.payload == request.payload
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        sender.close()
+        dealer.close()
+        context.term()
+
+
 @pytest.mark.parametrize("hops", [0, 1], ids=["hops-0", "hops-1"])
 def test_error_packet_addressed_to_the_router_is_never_answered(
     network_port: int, caplog: pytest.LogCaptureFixture, hops: int
@@ -1700,10 +1760,20 @@ def test_error_packet_addressed_to_the_router_is_never_answered(
         context.term()
 
 
-def test_data_packet_addressed_to_the_router_is_dropped_not_answered(network_port: int) -> None:
-    # A DATA Packet addressed to the Router is dropped with a log line. Whatever the Intent, the Router
-    # never answers a Packet addressed to itself with an error naming itself as the
-    # destination: the sender gets no reply at all.
+@pytest.mark.parametrize(
+    ("intent", "verb"),
+    [
+        (PacketIntent.DATA, Request.GET_PROVIDERS),
+        (PacketIntent.CONTROL, Request.GET_PARAMETER),
+    ],
+    ids=["data-packet", "control-packet"],
+)
+def test_data_packet_addressed_to_the_router_is_dropped_not_answered(
+    network_port: int, intent: PacketIntent, verb: Request
+) -> None:
+    # A DATA or CONTROL Packet addressed to the Router is dropped with a log line. Whatever the
+    # Intent, the Router never answers a Packet addressed to itself with an error naming
+    # itself as the destination: the sender gets no reply at all.
     context = zmq.Context()
     socket = context.socket(zmq.REQ)
     socket.setsockopt(zmq.REQ_RELAXED, 1)
@@ -1720,8 +1790,8 @@ def test_data_packet_addressed_to_the_router_is_dropped_not_answered(network_por
 
     try:
         request = Packet(
-            intent=PacketIntent.DATA,
-            request=Request.GET_PROVIDERS,
+            intent=intent,
+            request=verb,
             source="data-to-router-client",
             destination=ROUTER_NAME,
         )
