@@ -140,6 +140,86 @@ def _assert_error_reply(reply: Packet, request: Packet, code: ErrorCode) -> Erro
     return payload
 
 
+def _assert_still_running(property_router: _PropertyRouter) -> None:
+    """Assert the Router keeps running: a follow-up PING to it still gets its PONG."""
+    probe = Packet(intent=PacketIntent.PING, request=Request.PING, source=SENDER_NAME, destination=ROUTER_NAME)
+    property_router.send(encode(probe))
+    reply = property_router.receive(SENDER_NAME)
+    assert reply is not None
+    assert reply.request == Request.PONG
+    assert reply.reply_to == probe.id
+
+
+def _assert_request_to_router(property_router: _PropertyRouter, packet: Packet) -> None:
+    """Assert the outcome step 5 prescribes for a request to the Router."""
+    if packet.intent == PacketIntent.ERROR:
+        # An ERROR Packet addressed to the Router is logged, never answered.
+        assert property_router.receive(SENDER_NAME) is None
+        _assert_still_running(property_router)
+        return
+    match packet.request:
+        case Request.REGISTER:
+            # Step 5: handle the REGISTER (a Client registers too) and ACK.
+            reply = property_router.receive(SENDER_NAME)
+            assert reply is not None, "a REGISTER must get its acknowledgement"
+            assert reply.intent == PacketIntent.REGISTRATION_ACK
+            assert reply.request == Request.ACKNOWLEDGE
+            assert reply.source == ROUTER_NAME
+            assert reply.reply_to == packet.id
+        case Request.PING:
+            reply = property_router.receive(SENDER_NAME)
+            assert reply is not None, "a PING to the Router must get a PONG"
+            assert reply.intent == PacketIntent.PING
+            assert reply.request == Request.PONG
+            assert reply.source == ROUTER_NAME
+            assert reply.reply_to == packet.id
+        case Request.GET_PROVIDERS:
+            reply = property_router.receive(SENDER_NAME)
+            assert reply is not None, "a GET_PROVIDERS must get its reply"
+            assert reply.intent == PacketIntent.DATA
+            assert reply.request == Request.GET_PROVIDERS
+            assert reply.reply_to == packet.id
+            listed = {provider["name"] for provider in reply.payload["providers"]}
+            assert REGISTERED_PROVIDER in listed
+        case _:
+            # Step 5: anything else addressed to the Router is unsupported.
+            reply = property_router.receive(SENDER_NAME)
+            assert reply is not None, "an unsupported request must get a fast reply"
+            _assert_error_reply(reply, packet, ErrorCode.UNSUPPORTED_REQUEST)
+
+
+def _assert_forwarding(property_router: _PropertyRouter, packet: Packet) -> None:
+    """Assert the outcome step 6 prescribes for a Packet to another peer."""
+    if packet.request == Request.REGISTER:
+        # A REGISTER not addressed to the Router is malformed.
+        reply = property_router.receive(SENDER_NAME)
+        assert reply is not None, "a misaddressed REGISTER must get a fast reply"
+        _assert_error_reply(reply, packet, ErrorCode.MALFORMED_PACKET)
+        return
+
+    if packet.destination in CONNECTED_PEERS:
+        # Step 6: forward to the destination's identity with one more hop, registered or not.
+        forwarded = property_router.receive(packet.destination)
+        assert forwarded is not None, "a Packet to a connected peer must be forwarded"
+        assert forwarded == packet.model_copy(update={"hops": packet.hops + 1})
+        assert property_router.receive(SENDER_NAME) is None
+        return
+
+    if packet.intent == PacketIntent.ERROR:
+        # An ERROR Packet the Router cannot deliver is dropped with a warning, never
+        # answered: the sender never answers an ERROR either, so it would only log the answer.
+        assert property_router.receive(SENDER_NAME) is None
+        _assert_still_running(property_router)
+        return
+
+    # An unknown destination: not in the Directory and not connected.
+    reply = property_router.receive(SENDER_NAME)
+    assert reply is not None, "a Packet to an unknown destination must get a fast reply"
+    error = _assert_error_reply(reply, packet, ErrorCode.UNKNOWN_DESTINATION)
+    assert f"Destination '{UNKNOWN_NAME}' is not registered with {ROUTER_NAME}" in error.message
+    assert REGISTERED_PROVIDER in error.message
+
+
 @settings(max_examples=120, deadline=None)
 @given(
     intent=st.sampled_from(PacketIntent),
@@ -149,7 +229,7 @@ def _assert_error_reply(reply: Packet, request: Packet, code: ErrorCode) -> Erro
     spoofed=st.booleans(),
     destination=st.sampled_from(DESTINATIONS),
 )
-def test_router_outcomes(  # noqa: PLR0911, PLR0913, PLR0915 - one branch per prescribed outcome
+def test_router_outcomes(  # noqa: PLR0913 - the fixture plus one parameter per generated facet
     property_router: _PropertyRouter,
     intent: PacketIntent,
     request_verb: Request,
@@ -182,92 +262,12 @@ def test_router_outcomes(  # noqa: PLR0911, PLR0913, PLR0915 - one branch per pr
         assert reply is not None, "a wrong version must get a fast reply"
         error = _assert_error_reply(reply, packet, ErrorCode.UNSUPPORTED_VERSION)
         assert error.details == {"expected": PROTOCOL_VERSION, "received": version}
-        return
-
-    if spoofed:
+    elif spoofed:
         # Step 4: the source must match the identity frame the Packet arrived on.
         reply = property_router.receive(SENDER_NAME)
         assert reply is not None, "a spoofed source must get a fast reply"
         _assert_error_reply(reply, packet, ErrorCode.MALFORMED_PACKET)
-        return
-
-    if destination == ROUTER_NAME:
-        if intent == PacketIntent.ERROR:
-            # An ERROR Packet addressed to the Router is logged, never answered.
-            assert property_router.receive(SENDER_NAME) is None
-            # The Router keeps running: a follow-up PING to it still gets its PONG.
-            probe = Packet(intent=PacketIntent.PING, request=Request.PING, source=SENDER_NAME, destination=ROUTER_NAME)
-            property_router.send(encode(probe))
-            reply = property_router.receive(SENDER_NAME)
-            assert reply is not None
-            assert reply.request == Request.PONG
-            assert reply.reply_to == probe.id
-            return
-        match request_verb:
-            case Request.REGISTER:
-                # Step 5: handle the REGISTER (a Client registers too) and ACK.
-                reply = property_router.receive(SENDER_NAME)
-                assert reply is not None, "a REGISTER must get its acknowledgement"
-                assert reply.intent == PacketIntent.REGISTRATION_ACK
-                assert reply.request == Request.ACKNOWLEDGE
-                assert reply.source == ROUTER_NAME
-                assert reply.reply_to == packet.id
-                return
-            case Request.PING:
-                reply = property_router.receive(SENDER_NAME)
-                assert reply is not None, "a PING to the Router must get a PONG"
-                assert reply.intent == PacketIntent.PING
-                assert reply.request == Request.PONG
-                assert reply.source == ROUTER_NAME
-                assert reply.reply_to == packet.id
-                return
-            case Request.GET_PROVIDERS:
-                reply = property_router.receive(SENDER_NAME)
-                assert reply is not None, "a GET_PROVIDERS must get its reply"
-                assert reply.intent == PacketIntent.DATA
-                assert reply.request == Request.GET_PROVIDERS
-                assert reply.reply_to == packet.id
-                listed = {provider["name"] for provider in reply.payload["providers"]}
-                assert REGISTERED_PROVIDER in listed
-                return
-            case _:
-                # Step 5: anything else addressed to the Router is unsupported.
-                reply = property_router.receive(SENDER_NAME)
-                assert reply is not None, "an unsupported request must get a fast reply"
-                _assert_error_reply(reply, packet, ErrorCode.UNSUPPORTED_REQUEST)
-                return
-
-    if request_verb == Request.REGISTER:
-        # A REGISTER not addressed to the Router is malformed.
-        reply = property_router.receive(SENDER_NAME)
-        assert reply is not None, "a misaddressed REGISTER must get a fast reply"
-        _assert_error_reply(reply, packet, ErrorCode.MALFORMED_PACKET)
-        return
-
-    if destination in CONNECTED_PEERS:
-        # Step 6: forward to the destination's identity with one more hop, registered or not.
-        forwarded = property_router.receive(destination)
-        assert forwarded is not None, "a Packet to a connected peer must be forwarded"
-        assert forwarded == packet.model_copy(update={"hops": hops + 1})
-        assert property_router.receive(SENDER_NAME) is None
-        return
-
-    if intent == PacketIntent.ERROR:
-        # An ERROR Packet the Router cannot deliver is dropped with a warning, never
-        # answered: the sender never answers an ERROR either, so it would only log the answer.
-        assert property_router.receive(SENDER_NAME) is None
-        # The Router keeps running: a follow-up PING to the Router still gets its PONG.
-        probe = Packet(intent=PacketIntent.PING, request=Request.PING, source=SENDER_NAME, destination=ROUTER_NAME)
-        property_router.send(encode(probe))
-        reply = property_router.receive(SENDER_NAME)
-        assert reply is not None
-        assert reply.request == Request.PONG
-        assert reply.reply_to == probe.id
-        return
-
-    # An unknown destination: not in the Directory and not connected.
-    reply = property_router.receive(SENDER_NAME)
-    assert reply is not None, "a Packet to an unknown destination must get a fast reply"
-    error = _assert_error_reply(reply, packet, ErrorCode.UNKNOWN_DESTINATION)
-    assert f"Destination '{UNKNOWN_NAME}' is not registered with {ROUTER_NAME}" in error.message
-    assert REGISTERED_PROVIDER in error.message
+    elif destination == ROUTER_NAME:
+        _assert_request_to_router(property_router, packet)
+    else:
+        _assert_forwarding(property_router, packet)
