@@ -281,6 +281,14 @@ def _assert_error_reply(reply: Packet, request: Packet, code: ErrorCode, origin:
     return payload
 
 
+def _assert_registration_ack(ack: Packet, registration: Packet) -> None:
+    """Assert a reply is the REGISTRATION_ACK answering a registration Packet."""
+    assert ack.intent == PacketIntent.REGISTRATION_ACK
+    assert ack.request == Request.ACKNOWLEDGE
+    assert ack.payload is None
+    assert ack.reply_to == registration.id
+
+
 def test_client_ping(network_port: int) -> None:
     client = _client(network_port)
     response = client.ping(PROVIDER_NAME)
@@ -688,8 +696,7 @@ def test_router_sends_a_stale_reply_without_the_request_id_frame(network_port: i
     )
     socket.send(encode(registration))
     ack = decode(socket.recv())
-    assert ack.intent == PacketIntent.REGISTRATION_ACK
-    assert ack.reply_to == registration.id
+    _assert_registration_ack(ack, registration)
     # The Router sends the acknowledgement: it names itself as the source.
     assert ack.source == ROUTER_NAME
     assert ack.destination == "correlated-test-client"
@@ -766,11 +773,10 @@ def test_wrong_frame_count_gets_malformed_packet_and_the_router_keeps_running(ne
     )
     socket.send(encode(registration))
     ack = decode(socket.recv())
-    assert ack.intent == PacketIntent.REGISTRATION_ACK
+    _assert_registration_ack(ack, registration)
     # The Router sends the acknowledgement: it names itself as the source.
     assert ack.source == ROUTER_NAME
     assert ack.destination == "bad-frames-client"
-    assert ack.reply_to == registration.id
 
     try:
         # More frames than any peer sends (the REQ delimiter plus three data frames).
@@ -818,7 +824,8 @@ def test_garbage_bytes_get_malformed_packet_and_the_router_keeps_running(network
         source="garbage-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
     )
     socket.send(encode(registration))
-    assert decode(socket.recv()).intent == PacketIntent.REGISTRATION_ACK
+    registration_ack = decode(socket.recv())
+    _assert_registration_ack(registration_ack, registration)
 
     try:
         socket.send(b"\x80\x04\x95pickle-bytes")
@@ -871,7 +878,7 @@ def test_garbage_bytes_from_a_dealer_with_a_non_utf8_identity_get_malformed_pack
     )
     socket.send(encode(registration))
     _, ack_data = socket.recv_multipart()
-    assert decode(ack_data).intent == PacketIntent.REGISTRATION_ACK
+    _assert_registration_ack(decode(ack_data), registration)
 
     try:
         socket.send(b"\x80\x04\x95pickle-bytes")
@@ -941,8 +948,7 @@ def test_a_non_utf8_identity_client_receives_the_routers_own_replies(network_por
         )
         socket.send(encode(registration))
         ack = decode(socket.recv())
-        assert ack.intent == PacketIntent.REGISTRATION_ACK
-        assert ack.reply_to == registration.id
+        _assert_registration_ack(ack, registration)
     finally:
         # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
         # context that outlives its socket can block the interpreter at exit in zmq term().
@@ -1007,6 +1013,68 @@ def test_router_error_replies_answer_the_identity_frame_not_the_source(network_p
         assert payload.code == ErrorCode.UNSUPPORTED_VERSION
         assert payload.origin == ROUTER_NAME
         assert payload.details == {"expected": PROTOCOL_VERSION, "received": 3}
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        socket.close()
+        context.term()
+
+
+def test_wrong_version_error_packet_gets_unsupported_version(
+    network_port: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The version check precedes Intent handling, so every Packet gets UNSUPPORTED_VERSION on
+    # a wrong version, an ERROR Packet included (an ERROR Packet addressed to the Router
+    # is never answered, but the version check comes first). The registered peer the ERROR Packet is
+    # addressed to receives nothing: the Provider logs a warning for an ERROR Packet it never
+    # asked for, so no such warning means it was never forwarded.
+    context = zmq.Context()
+    socket = context.socket(zmq.REQ)
+    socket.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+    socket.setsockopt_string(zmq.IDENTITY, "stale-error-client")
+    socket.connect(f"tcp://{HOST}:{network_port}")
+
+    registration = create_registration_packet(
+        source="stale-error-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
+    )
+    socket.send(encode(registration))
+    registration_ack = decode(socket.recv())
+    _assert_registration_ack(registration_ack, registration)
+
+    try:
+        request = Packet(
+            intent=PacketIntent.ERROR,
+            request=Request.ERROR,
+            source="stale-error-client",
+            destination=PROVIDER_NAME,
+            payload=ErrorPayload(
+                code=ErrorCode.INSTRUMENT_ERROR, message="a stale error", origin="stale-error-client"
+            ).model_dump(),
+        )
+        wire = json.loads(encode(request))
+        wire["version"] = 3
+        with caplog.at_level(logging.WARNING, logger="pqn_hardware.network.instrument_provider"):
+            socket.send(json.dumps(wire).encode("utf-8"))
+            reply = decode(socket.recv())
+
+        assert reply.intent == PacketIntent.ERROR
+        assert reply.reply_to == request.id
+        payload = ErrorPayload.model_validate(reply.payload)
+        assert payload.code == ErrorCode.UNSUPPORTED_VERSION
+        assert payload.origin == ROUTER_NAME
+        assert payload.details == {"expected": PROTOCOL_VERSION, "received": 3}
+
+        # The Provider received nothing: it logged no warning during the request.
+        assert not [record for record in caplog.records if record.name == "pqn_hardware.network.instrument_provider"]
+
+        # The Router keeps serving after refusing the wrong-version ERROR Packet.
+        ping = Packet(
+            intent=PacketIntent.PING, request=Request.PING, source="stale-error-client", destination=PROVIDER_NAME
+        )
+        socket.send(encode(ping))
+        pong = decode(socket.recv())
+        assert pong.request == Request.PONG
+        assert pong.reply_to == ping.id
     finally:
         # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
         # context that outlives its socket can block the interpreter at exit in zmq term().
@@ -1112,7 +1180,8 @@ def test_json_that_is_not_a_usable_envelope_gets_malformed_packet(network_port: 
         source="json-envelope-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
     )
     socket.send(encode(registration))
-    assert decode(socket.recv()).intent == PacketIntent.REGISTRATION_ACK
+    registration_ack = decode(socket.recv())
+    _assert_registration_ack(registration_ack, registration)
 
     try:
         socket.send(wire)
@@ -1173,8 +1242,7 @@ def test_unsupported_version_register_gets_unsupported_version_error(network_por
         )
         socket.send(encode(v2_request))
         ack = decode(socket.recv())
-        assert ack.intent == PacketIntent.REGISTRATION_ACK
-        assert ack.reply_to == v2_request.id
+        _assert_registration_ack(ack, v2_request)
     finally:
         # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
         # context that outlives its socket can block the interpreter at exit in zmq term().
@@ -1199,7 +1267,8 @@ def test_unsupported_version_gets_unsupported_version_error(network_port: int, v
         source="old-version-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
     )
     socket.send(encode(registration))
-    assert decode(socket.recv()).intent == PacketIntent.REGISTRATION_ACK
+    registration_ack = decode(socket.recv())
+    _assert_registration_ack(registration_ack, registration)
 
     try:
         # A hand-written wire envelope speaking another protocol version.
@@ -1248,7 +1317,8 @@ def test_missing_version_gets_malformed_packet(network_port: int) -> None:
         source="no-version-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
     )
     socket.send(encode(registration))
-    assert decode(socket.recv()).intent == PacketIntent.REGISTRATION_ACK
+    registration_ack = decode(socket.recv())
+    _assert_registration_ack(registration_ack, registration)
 
     try:
         # A hand-written wire envelope with no version at all.
@@ -1295,7 +1365,8 @@ def test_invalid_registration_payload_gets_malformed_packet(network_port: int) -
         source="bad-register-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
     )
     socket.send(encode(registration))
-    assert decode(socket.recv()).intent == PacketIntent.REGISTRATION_ACK
+    registration_ack = decode(socket.recv())
+    _assert_registration_ack(registration_ack, registration)
 
     try:
         # A REGISTER Packet whose Payload fails validation: no valid registration kind.
@@ -1343,7 +1414,8 @@ def test_unknown_destination_error_lists_registered_providers(network_port: int)
         source="lost-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
     )
     socket.send(encode(registration))
-    assert decode(socket.recv()).intent == PacketIntent.REGISTRATION_ACK
+    registration_ack = decode(socket.recv())
+    _assert_registration_ack(registration_ack, registration)
 
     try:
         request = Packet(
@@ -1378,7 +1450,8 @@ def test_error_packet_addressed_to_the_router_is_never_answered(
         source="error-sender-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
     )
     socket.send(encode(registration))
-    assert decode(socket.recv()).intent == PacketIntent.REGISTRATION_ACK
+    registration_ack = decode(socket.recv())
+    _assert_registration_ack(registration_ack, registration)
 
     try:
         error_packet = Packet(
@@ -1428,8 +1501,7 @@ def test_unsolicited_packets_to_a_waiting_client_are_dropped(network_port: int) 
         source="waiting-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
     )
     waiter.send(encode(registration))
-    ack = decode(waiter.recv())
-    assert ack.intent == PacketIntent.REGISTRATION_ACK
+    _assert_registration_ack(decode(waiter.recv()), registration)
 
     # A slow request the waiting client sits on.
     toggle = Packet(
@@ -1450,7 +1522,7 @@ def test_unsolicited_packets_to_a_waiting_client_are_dropped(network_port: int) 
         source="sending-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
     )
     sender.send(encode(sender_registration))
-    assert decode(sender.recv()).intent == PacketIntent.REGISTRATION_ACK
+    _assert_registration_ack(decode(sender.recv()), sender_registration)
     unsolicited = Packet(
         intent=PacketIntent.DATA, request=Request.GET_DEVICES, source="sending-client", destination="waiting-client"
     )
