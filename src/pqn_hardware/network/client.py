@@ -1,5 +1,4 @@
 import logging
-import pickle
 import secrets
 import string
 from collections.abc import Callable
@@ -13,11 +12,20 @@ import zmq
 
 from pqn_hardware.errors import PacketError
 from pqn_hardware.instrument import Instrument
-from pqn_hardware.instrument import InstrumentInfo
+from pqn_hardware.network.packet import CallOperationPayload
+from pqn_hardware.network.packet import DevicesPayload
+from pqn_hardware.network.packet import DeviceSummary
+from pqn_hardware.network.packet import GetDeviceStructurePayload
+from pqn_hardware.network.packet import GetInfoPayload
+from pqn_hardware.network.packet import GetParameterPayload
 from pqn_hardware.network.packet import NetworkElementClass
 from pqn_hardware.network.packet import Packet
 from pqn_hardware.network.packet import PacketIntent
+from pqn_hardware.network.packet import Request
+from pqn_hardware.network.packet import SetParameterPayload
 from pqn_hardware.network.packet import create_registration_packet
+from pqn_hardware.network.packet import decode
+from pqn_hardware.network.packet import encode
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +78,7 @@ class ClientBase:
         self.connected = True
 
         reg_packet = create_registration_packet(
-            source=self.name, destination=self.router_name, payload=NetworkElementClass.CLIENT, hops=0
+            source=self.name, destination=self.router_name, kind=NetworkElementClass.CLIENT
         )
         ret = self.ask(reg_packet)
         if ret is None:
@@ -105,14 +113,14 @@ class ClientBase:
 
         # try so that if timeout happens, the client remains usable
 
-        self.socket.send(pickle.dumps(packet))
+        self.socket.send(encode(packet))
         try:
             response = self.socket.recv()
         except zmq.error.Again as e:
             logger.exception("Timeout occurred.")
             raise TimeoutError from e
 
-        ret: Packet = pickle.loads(response)
+        ret: Packet = decode(response)
         logger.debug("Response received.")
         logger.debug("Response: %s", str(ret))
         if ret.intent == PacketIntent.ERROR:
@@ -121,7 +129,7 @@ class ClientBase:
         return ret
 
     def create_control_packet(
-        self, destination: str, request: str, payload: tuple[tuple[Any, ...], dict[str, Any]]
+        self, destination: str, request: Request, payload: dict[str, Any] | None = None
     ) -> Packet:
         return Packet(
             intent=PacketIntent.CONTROL,
@@ -131,7 +139,7 @@ class ClientBase:
             payload=payload,
         )
 
-    def create_data_packet(self, destination: str, request: str, payload: Any) -> Packet:
+    def create_data_packet(self, destination: str, request: Request, payload: dict[str, Any] | None = None) -> Packet:
         return Packet(
             intent=PacketIntent.DATA,
             request=request,
@@ -161,30 +169,63 @@ class InstrumentClient(ClientBase):
         self.provider_name = init_args.provider_name
 
     def trigger_operation(self, operation: str, *args: Any, **kwargs: Any) -> Any:
+        # TODO: Bind positional arguments to their names from the device structure so they can go on the wire.
+        if args:
+            msg = (
+                f"Operation '{operation}' was called with positional arguments {args}. "
+                "Operation arguments must be passed by keyword."
+            )
+            raise TypeError(msg)
+
         packet = self.create_control_packet(
-            self.provider_name, self.instrument_name + ":OPERATION:" + operation, (args, kwargs)
+            self.provider_name,
+            Request.CALL_OPERATION,
+            CallOperationPayload(instrument=self.instrument_name, operation=operation, kwargs=kwargs).model_dump(),
         )
         response = self.ask(packet)
 
-        return response.payload
+        return self._response_value(response)
 
     def trigger_parameter(self, parameter: str, *args: Any, **kwargs: Any) -> Any:
+        values = (*args, *kwargs.values())
+        if len(values) > 1:
+            msg = f"Setting parameter '{parameter}' takes exactly one value, got {len(values)}."
+            raise TypeError(msg)
+
+        if values:
+            packet = self.create_control_packet(
+                self.provider_name,
+                Request.SET_PARAMETER,
+                SetParameterPayload(instrument=self.instrument_name, parameter=parameter, value=values[0]).model_dump(),
+            )
+        else:
+            packet = self.create_control_packet(
+                self.provider_name,
+                Request.GET_PARAMETER,
+                GetParameterPayload(instrument=self.instrument_name, parameter=parameter).model_dump(),
+            )
+
+        response = self.ask(packet)
+
+        return self._response_value(response)
+
+    def get_info(self) -> Any:
+        # TODO: Rebuild the typed InstrumentInfo from the type path in the device structure.
         packet = self.create_control_packet(
-            self.provider_name, self.instrument_name + ":PARAMETER:" + parameter, (args, kwargs)
+            self.provider_name,
+            Request.GET_INFO,
+            GetInfoPayload(instrument=self.instrument_name).model_dump(),
         )
 
         response = self.ask(packet)
-        return response.payload
 
-    def get_info(self) -> InstrumentInfo:
-        packet = self.create_control_packet(self.provider_name, self.instrument_name + ":INFO:", ((), {}))
+        return self._response_value(response)
 
-        response = self.ask(packet)
-        if not isinstance(response.payload, InstrumentInfo):
-            msg = "Asking for info to proxy driver did not get a InstrumentInfo object."
-            raise PacketError(msg)
-
-        return response.payload
+    @staticmethod
+    def _response_value(response: Packet) -> Any:
+        if response.payload is None:
+            return None
+        return response.payload["value"]
 
 
 class ProxyInstrumentInit(NamedTuple):
@@ -267,34 +308,38 @@ class ProxyInstrument(Instrument):
         self.client.disconnect()
 
     @property
-    def info(self) -> InstrumentInfo:
+    def info(self) -> Any:
         return self.client.get_info()
 
 
 class Client(ClientBase):
     def ping(self, destination: str) -> Packet | None:
         ping_packet = Packet(
-            intent=PacketIntent.PING, request="PING", source=self.name, destination=destination, hops=0, payload=None
+            intent=PacketIntent.PING,
+            request=Request.PING,
+            source=self.name,
+            destination=destination,
+            hops=0,
+            payload=None,
         )
         return self.ask(ping_packet)
 
-    def get_available_devices(self, provider_name: str) -> dict[str, str]:
-        packet = self.create_data_packet(provider_name, "GET_DEVICES", None)
+    def get_available_devices(self, provider_name: str) -> dict[str, DeviceSummary]:
+        packet = self.create_data_packet(provider_name, Request.GET_DEVICES, None)
         response = self.ask(packet)
 
-        if not isinstance(response.payload, dict):
-            msg = "Payload is not a dictionary."
-            raise PacketError(msg)
+        devices = DevicesPayload.model_validate(response.payload)
 
-        return response.payload
+        return devices.devices
 
     def get_device(self, provider_name: str, device_name: str, timeout_ms: int = 60_000) -> Instrument:
-        packet = self.create_data_packet(provider_name, "GET_DEVICE_STRUCTURE", device_name)
+        packet = self.create_data_packet(
+            provider_name,
+            Request.GET_DEVICE_STRUCTURE,
+            GetDeviceStructurePayload(instrument=device_name).model_dump(),
+        )
 
         response = self.ask(packet)
-
-        if response.intent == PacketIntent.ERROR:
-            raise PacketError(str(response))
 
         if not isinstance(response.payload, dict):
             msg = "Payload is not a dictionary."

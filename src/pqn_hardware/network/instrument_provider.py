@@ -1,18 +1,33 @@
 import datetime
 import importlib
 import logging
-import pickle
+from typing import TYPE_CHECKING
 from typing import Any
 
 import zmq
 
 from pqn_hardware.errors import CouldNotConnectToNetworkElementError
 from pqn_hardware.errors import InvalidInstrumentsConfigurationError
-from pqn_hardware.instrument import Instrument
+from pqn_hardware.network.packet import CallOperationPayload
+from pqn_hardware.network.packet import DevicesPayload
+from pqn_hardware.network.packet import DeviceSummary
+from pqn_hardware.network.packet import ErrorCode
+from pqn_hardware.network.packet import ErrorPayload
+from pqn_hardware.network.packet import GetDeviceStructurePayload
+from pqn_hardware.network.packet import GetInfoPayload
+from pqn_hardware.network.packet import GetParameterPayload
 from pqn_hardware.network.packet import NetworkElementClass
 from pqn_hardware.network.packet import Packet
 from pqn_hardware.network.packet import PacketIntent
+from pqn_hardware.network.packet import Request
+from pqn_hardware.network.packet import SetParameterPayload
+from pqn_hardware.network.packet import ValuePayload
 from pqn_hardware.network.packet import create_registration_packet
+from pqn_hardware.network.packet import decode
+from pqn_hardware.network.packet import encode
+
+if TYPE_CHECKING:
+    from pqn_hardware.instrument import Instrument
 
 logger = logging.getLogger(__name__)
 
@@ -153,24 +168,24 @@ class InstrumentProvider:
                 match packet.intent:
                     case PacketIntent.PING:
                         response = self._handle_ping(packet)
-                        self.socket.send(pickle.dumps(response))
+                        self.socket.send(encode(response))
 
                     case PacketIntent.REGISTRATION_ACK:
                         self._handle_reg_acknowledge()
 
                     case PacketIntent.DATA:
                         match packet.request:
-                            case "GET_DEVICES":
+                            case Request.GET_DEVICES:
                                 response = self._handle_get_devices(packet)
-                                self.socket.send(pickle.dumps(response))
+                                self.socket.send(encode(response))
 
-                            case "GET_DEVICE_STRUCTURE":
+                            case Request.GET_DEVICE_STRUCTURE:
                                 response = self._handle_get_device_structure(packet)
-                                self.socket.send(pickle.dumps(response))
+                                self.socket.send(encode(response))
 
                     case PacketIntent.CONTROL:
                         response = self._handle_instrument_control(packet)
-                        self.socket.send(pickle.dumps(response))
+                        self.socket.send(encode(response))
 
         finally:
             self.socket.close()
@@ -182,18 +197,14 @@ class InstrumentProvider:
             logger.error(msg)
             raise RuntimeError(msg)
 
-        _, pickled_packet = self.socket.recv_multipart()
-        packet = pickle.loads(pickled_packet)
+        _, data = self.socket.recv_multipart()
+        packet = decode(data)
         if packet.destination != self.name:
             # FIXME: This should return an error packet instead of just crashing
             msg = f"Packet intended for {packet.destination} but received by {self.name}. Packet: {packet}"
             raise RuntimeError(msg)
 
         logger.info("Received packet: %s", packet)
-
-        if not isinstance(packet, Packet):
-            msg = f"Received packet is not a Packet object, got {type(packet)}"
-            raise TypeError(msg)
 
         return packet
 
@@ -223,9 +234,9 @@ class InstrumentProvider:
 
             self.socket.connect(self.address)
             reg_packet = create_registration_packet(
-                source=self.name, destination=self.router_name, payload=NetworkElementClass.PROVIDER, hops=0
+                source=self.name, destination=self.router_name, kind=NetworkElementClass.PROVIDER
             )
-            self.socket.send(pickle.dumps(reg_packet))
+            self.socket.send(encode(reg_packet))
             logger.info("Sent registration packet to router at %s", self.address)
             self._beats_since_reply += 1
 
@@ -240,159 +251,177 @@ class InstrumentProvider:
 
     def _handle_ping(self, packet: Packet) -> Packet:
         return Packet(
-            intent=PacketIntent.PING, request="PONG", source=self.name, destination=packet.source, payload=None
+            intent=PacketIntent.PING,
+            request=Request.PONG,
+            source=self.name,
+            destination=packet.source,
+            payload=None,
         )
 
     def _handle_get_devices(self, packet: Packet) -> Packet:
-        ret_instruments = {name: type(ins) for name, ins in self.instantiated_instruments.items()}
+        devices = {
+            name: DeviceSummary(
+                type=f"{type(ins).__module__}.{type(ins).__qualname__}",
+                desc=ins.desc,
+                hw_address=ins.hw_address,
+            )
+            for name, ins in self.instantiated_instruments.items()
+        }
         return Packet(
             intent=PacketIntent.DATA,
-            request="GET_DEVICES",
+            request=Request.GET_DEVICES,
             source=self.name,
             destination=packet.source,
-            payload=ret_instruments,
+            payload=DevicesPayload(devices=devices).model_dump(),
         )
 
     def _handle_get_device_structure(self, packet: Packet) -> Packet:
-        if packet.payload not in self.instantiated_instruments:
-            return self._create_error_packet(packet.source, f"Instrument '{packet.payload}' not found.")
+        request_payload = GetDeviceStructurePayload.model_validate(packet.payload)
+        ins_name = request_payload.instrument
 
-        ins_name = packet.payload
-        if not isinstance(ins_name, str):
+        if ins_name not in self.instantiated_instruments:
             return self._create_error_packet(
-                packet.source, f"Payload must be the instrument name as a string, not {type(ins_name)}"
+                packet.source, ErrorCode.UNKNOWN_INSTRUMENT, f"Instrument '{ins_name}' not found."
             )
 
-        params = self.instantiated_instruments[ins_name].parameters
-        operations = set(self.instantiated_instruments[ins_name].operations.keys())
+        instrument = self.instantiated_instruments[ins_name]
 
         payload = {
-            "name": self.instantiated_instruments[ins_name].name,
-            "desc": self.instantiated_instruments[ins_name].desc,
-            "hw_address": self.instantiated_instruments[ins_name].hw_address,
-            "parameters": params,
-            "operations": operations,
+            "name": instrument.name,
+            "desc": instrument.desc,
+            "hw_address": instrument.hw_address,
+            "parameters": sorted(instrument.parameters),
+            "operations": sorted(instrument.operations),
         }
 
         return Packet(
             intent=PacketIntent.DATA,
-            request="GET_DEVICE_STRUCTURE",
+            request=Request.GET_DEVICE_STRUCTURE,
             source=self.name,
             destination=packet.source,
             payload=payload,
         )
 
-    def _validate_instrument_control_packet(
-        self, packet: Packet
-    ) -> tuple[str, str, str, Instrument, tuple[Any, ...], dict[str, Any]] | Packet:
-        request_parts = packet.request.split(":")
-        correct_request_len = 3
-        if len(request_parts) != correct_request_len:
-            msg = (
-                f"CONTROL packets should have a request field with 3 parts divided by a ':', "
-                f"not {len(request_parts)}, formatted as: "
-                f"<instrument_name>:<OPERATION/PARAMETER/INFO>:<Operation/Parameter name/empty for info>"
-            )
-            return self._create_error_packet(packet.source, msg)
+    def _handle_operation_control(self, packet: Packet) -> Packet:
+        request_payload = CallOperationPayload.model_validate(packet.payload)
 
-        ins_name, request_type, request_name = request_parts
-        if ins_name not in self.instantiated_instruments:
-            return self._create_error_packet(packet.source, f"Instrument '{ins_name}' not found.")
-
-        instrument = self.instantiated_instruments[ins_name]
-
-        if request_type not in ["OPERATION", "PARAMETER", "INFO"]:
-            msg = f"Request type must be either 'OPERATION', 'PARAMETER', 'INFO', not {request_type}"
-            return self._create_error_packet(packet.source, msg)
-
-        if not isinstance(packet.payload, tuple):
-            msg = (
-                f"Payload must be a tuple with the arguments and kwargs (have empty args and kwargs "
-                f"if not necessary) for the operation or parameter, not {type(packet.payload)}"
-            )
-            return self._create_error_packet(packet.source, msg)
-
-        args, kwargs = packet.payload
-        return ins_name, request_type, request_name, instrument, args, kwargs
-
-    def _handle_operation_control(
-        self, request_name: str, instrument: Instrument, packet: Packet, args: tuple[Any, ...], kwargs: dict[str, Any]
-    ) -> Packet:
-        if request_name not in instrument.operations:
+        if request_payload.instrument not in self.instantiated_instruments:
             return self._create_error_packet(
-                packet.source, f"Operation '{request_name}' not found in '{instrument.name}'"
+                packet.source, ErrorCode.UNKNOWN_INSTRUMENT, f"Instrument '{request_payload.instrument}' not found."
+            )
+        instrument = self.instantiated_instruments[request_payload.instrument]
+
+        if request_payload.operation not in instrument.operations:
+            return self._create_error_packet(
+                packet.source,
+                ErrorCode.UNKNOWN_OPERATION,
+                f"Operation '{request_payload.operation}' not found in '{instrument.name}'",
             )
 
         try:
-            operation_ret = instrument.operations[request_name](*args, **kwargs)
+            operation_ret = instrument.operations[request_payload.operation](**request_payload.kwargs)
         # Adding ruff exception due to not know what type of exceptions instruments can raise.
         except Exception as e:  # noqa:BLE001
-            msg = f"Error executing operation '{request_name}' in '{instrument.name}'. Error: {e}"
-            return self._create_error_packet(packet.source, msg)
+            msg = f"Error executing operation '{request_payload.operation}' in '{instrument.name}'. Error: {e}"
+            return self._create_error_packet(packet.source, ErrorCode.INSTRUMENT_ERROR, msg)
 
-        return self._create_control_packet(packet.source, f"{instrument.name}:OPERATION:{request_name}", operation_ret)
+        return self._create_control_packet(
+            packet.source, Request.CALL_OPERATION, ValuePayload(value=operation_ret).model_dump()
+        )
 
-    def _handle_parameter_control(
-        self, request_name: str, instrument: Instrument, packet: Packet, args: tuple[Any, ...], kwargs: dict[str, Any]
-    ) -> Packet:
-        if request_name not in instrument.parameters:
+    def _handle_parameter_read(self, packet: Packet) -> Packet:
+        request_payload = GetParameterPayload.model_validate(packet.payload)
+
+        if request_payload.instrument not in self.instantiated_instruments:
             return self._create_error_packet(
-                packet.source, f"Parameter '{request_name}' not found in '{instrument.name}'"
+                packet.source, ErrorCode.UNKNOWN_INSTRUMENT, f"Instrument '{request_payload.instrument}' not found."
             )
+        instrument = self.instantiated_instruments[request_payload.instrument]
 
-            # Check if this is just reading the parameter or setting it.
-        if len(args) == 0 and len(kwargs) == 0:
-            try:
-                parameter_ret = getattr(instrument, request_name)
-            except AttributeError as e:
-                msg = f"Error reading parameter '{request_name}' in '{instrument.name}'. Error: {e}"
-                return self._create_error_packet(packet.source, msg)
-
-            return self._create_control_packet(
-                packet.source, f"{instrument.name}:PARAMETER:{request_name}", parameter_ret
+        if request_payload.parameter not in instrument.parameters:
+            return self._create_error_packet(
+                packet.source,
+                ErrorCode.UNKNOWN_PARAMETER,
+                f"Parameter '{request_payload.parameter}' not found in '{instrument.name}'",
             )
 
         try:
-            setattr(instrument, request_name, *args, **kwargs)
-            # TODO: Double check this exception type, I am not entirely sure this would work.
+            parameter_ret = getattr(instrument, request_payload.parameter)
         except AttributeError as e:
-            msg = f"Error setting parameter '{request_name}' in '{instrument.name}'. Error: {e}"
-            return self._create_error_packet(packet.source, msg)
+            msg = f"Error reading parameter '{request_payload.parameter}' in '{instrument.name}'. Error: {e}"
+            return self._create_error_packet(packet.source, ErrorCode.INSTRUMENT_ERROR, msg)
 
-        return self._create_control_packet(packet.source, f"{instrument.name}:PARAMETER:{request_name}", "OK")
-
-    def _handle_instrument_control(self, packet: Packet) -> Packet:
-        validated_packet = self._validate_instrument_control_packet(packet)
-
-        # If it's a packet it means that there was an error with the incoming packet so return the error packet.
-        if isinstance(validated_packet, Packet):
-            return validated_packet
-
-        ins_name, request_type, request_name, instrument, args, kwargs = validated_packet
-
-        if request_type == "OPERATION":
-            return self._handle_operation_control(request_name, instrument, packet, args, kwargs)
-
-        if request_type == "PARAMETER":
-            return self._handle_parameter_control(request_name, instrument, packet, args, kwargs)
-
-        if request_type == "INFO":
-            return self._create_control_packet(packet.source, f"{ins_name}:INFO", instrument.info)
-
-        # All the possible packet options should have been handled by now, so if we get here, something went wrong.
-        msg = f"Something inside provider {self.name} went wrong. Check that your packet is correct and try again."
-        return self._create_error_packet(packet.source, msg)
-
-    def _create_error_packet(self, destination: str, error_msg: str) -> Packet:
-        return Packet(
-            intent=PacketIntent.ERROR,
-            request="ERROR",
-            source=self.name,
-            destination=destination,
-            payload=error_msg,
+        return self._create_control_packet(
+            packet.source, Request.GET_PARAMETER, ValuePayload(value=parameter_ret).model_dump()
         )
 
-    def _create_control_packet(self, destination: str, request: str, payload: Any) -> Packet:
+    def _handle_parameter_write(self, packet: Packet) -> Packet:
+        request_payload = SetParameterPayload.model_validate(packet.payload)
+
+        if request_payload.instrument not in self.instantiated_instruments:
+            return self._create_error_packet(
+                packet.source, ErrorCode.UNKNOWN_INSTRUMENT, f"Instrument '{request_payload.instrument}' not found."
+            )
+        instrument = self.instantiated_instruments[request_payload.instrument]
+
+        if request_payload.parameter not in instrument.parameters:
+            return self._create_error_packet(
+                packet.source,
+                ErrorCode.UNKNOWN_PARAMETER,
+                f"Parameter '{request_payload.parameter}' not found in '{instrument.name}'",
+            )
+
+        try:
+            setattr(instrument, request_payload.parameter, request_payload.value)
+            # TODO: Double check this exception type, I am not entirely sure this would work.
+        except AttributeError as e:
+            msg = f"Error setting parameter '{request_payload.parameter}' in '{instrument.name}'. Error: {e}"
+            return self._create_error_packet(packet.source, ErrorCode.INSTRUMENT_ERROR, msg)
+
+        return self._create_control_packet(packet.source, Request.SET_PARAMETER, None)
+
+    def _handle_info_control(self, packet: Packet) -> Packet:
+        request_payload = GetInfoPayload.model_validate(packet.payload)
+
+        if request_payload.instrument not in self.instantiated_instruments:
+            return self._create_error_packet(
+                packet.source, ErrorCode.UNKNOWN_INSTRUMENT, f"Instrument '{request_payload.instrument}' not found."
+            )
+        instrument = self.instantiated_instruments[request_payload.instrument]
+
+        return self._create_control_packet(
+            packet.source, Request.GET_INFO, ValuePayload(value=instrument.info).model_dump()
+        )
+
+    def _handle_instrument_control(self, packet: Packet) -> Packet:
+        match packet.request:
+            case Request.CALL_OPERATION:
+                return self._handle_operation_control(packet)
+
+            case Request.GET_PARAMETER:
+                return self._handle_parameter_read(packet)
+
+            case Request.SET_PARAMETER:
+                return self._handle_parameter_write(packet)
+
+            case Request.GET_INFO:
+                return self._handle_info_control(packet)
+
+            case _:
+                return self._create_error_packet(
+                    packet.source, ErrorCode.UNSUPPORTED_REQUEST, f"Unsupported request '{packet.request}'"
+                )
+
+    def _create_error_packet(self, destination: str, code: ErrorCode, error_msg: str) -> Packet:
+        return Packet(
+            intent=PacketIntent.ERROR,
+            request=Request.ERROR,
+            source=self.name,
+            destination=destination,
+            payload=ErrorPayload(code=code, message=error_msg, origin=self.name).model_dump(),
+        )
+
+    def _create_control_packet(self, destination: str, request: Request, payload: dict[str, Any] | None) -> Packet:
         return Packet(
             intent=PacketIntent.CONTROL,
             request=request,
