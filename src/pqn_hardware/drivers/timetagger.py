@@ -19,7 +19,7 @@ try:
     from TimeTagger import freeTimeTagger
 except ImportError:  # pragma: no cover - exercised only where the SDK is absent
     ChannelEdge = Correlation = Counter = TimeTagger = None
-    createTimeTaggerNetwork = freeTimeTagger = None
+    createTimeTaggerNetwork = freeTimeTagger = None  # noqa: N816 - mirror the SDK names
 
 from pqn_hardware.instrument import TimeTaggerInfo
 from pqn_hardware.instrument import TimeTaggerInstrument
@@ -134,6 +134,8 @@ RABBIT_COUNTERS_PER_PACKET = 256
 RABBIT_PACKET_SIZE = 1026  # 1 cmd byte + 1 packet-index byte + 256 * 4 counter bytes
 RABBIT_MAX_PACKETS = RABBIT_COUNTER_COUNT // RABBIT_COUNTERS_PER_PACKET  # 8
 RABBIT_RECV_TIMEOUT_S = 2.0
+RABBIT_RUNTIME_REPLY_SIZE = 5  # 1 cmd byte + 4-byte little-endian uint32
+RABBIT_DELAY_LINE_TIMINGS_SIZE = 11
 
 
 @dataclass(slots=True)
@@ -243,14 +245,14 @@ class RabbitTimeTagger(TimeTaggerInstrument):
     def runtime_ms(self) -> int:
         """Return milliseconds elapsed since the last run() (T)."""
         reply = self._command(b"T", expect_reply=True)
-        if reply[:1] != b"T" or len(reply) < 5:
+        if reply[:1] != b"T" or len(reply) < RABBIT_RUNTIME_REPLY_SIZE:
             msg = f"Unexpected runtime reply from Rabbit coincidence counter: {reply!r}"
             raise RuntimeError(msg)
-        return struct.unpack_from("<I", reply, 1)[0]
+        return int(struct.unpack_from("<I", reply, 1)[0])
 
     def set_delay_lines(self, timings: bytes) -> None:
         """Configure the delay-line timings (D + 11 bytes)."""
-        if len(timings) != 11:
+        if len(timings) != RABBIT_DELAY_LINE_TIMINGS_SIZE:
             msg = f"Delay-line command requires exactly 11 bytes, got {len(timings)}."
             raise ValueError(msg)
         self._command(b"D" + timings)
