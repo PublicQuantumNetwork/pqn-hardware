@@ -1,20 +1,25 @@
+import importlib
 import logging
 import secrets
 import string
-from collections.abc import Callable
 from dataclasses import dataclass
+from dataclasses import field
+from dataclasses import is_dataclass
 from types import TracebackType
 from typing import Any
 from typing import NamedTuple
 from typing import Self
 
 import zmq
+from pydantic import TypeAdapter
+from pydantic import ValidationError
 
 from pqn_hardware.errors import PacketError
 from pqn_hardware.instrument import Instrument
 from pqn_hardware.network.packet import CallOperationPayload
 from pqn_hardware.network.packet import DevicesPayload
 from pqn_hardware.network.packet import DeviceSummary
+from pqn_hardware.network.packet import ErrorPayload
 from pqn_hardware.network.packet import GetDeviceStructurePayload
 from pqn_hardware.network.packet import GetInfoPayload
 from pqn_hardware.network.packet import GetParameterPayload
@@ -28,6 +33,34 @@ from pqn_hardware.network.packet import decode
 from pqn_hardware.network.packet import encode
 
 logger = logging.getLogger(__name__)
+
+
+def _dump_argument(value: Any) -> Any:
+    """Dump a dataclass argument to JSON data; every other value passes through as it is."""
+    if is_dataclass(value) and not isinstance(value, type):
+        return TypeAdapter(type(value)).dump_python(value, mode="json")
+    return value
+
+
+def _rebuild_value(value: Any, type_path: str | None) -> Any:
+    """Rebuild a typed value from its Python import path in the Device structure (ADR-0002).
+
+    A null type path means the value is JSON-native. When the path cannot be imported or the
+    value does not validate, the plain JSON data is returned and a warning is logged.
+    """
+    if type_path is None:
+        return value
+    try:
+        module_name, _, type_name = type_path.rpartition(".")
+        type_ = getattr(importlib.import_module(module_name), type_name)
+        return TypeAdapter(type_).validate_python(value)
+    # ValueError: a path without a dot makes import_module raise it; any import failure falls
+    # back to the plain JSON data (ADR-0002).
+    except (ImportError, AttributeError, ValueError, ValidationError) as e:
+        logger.warning(
+            "Could not rebuild the value as %s; returning the plain JSON data instead. Error: %s", type_path, e
+        )
+        return value
 
 
 class ClientBase:
@@ -72,6 +105,11 @@ class ClientBase:
         logger.info("Starting client '%s' Connecting to %s", self.name, self.address)
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REQ)
+        # A timeout must not break the socket: with REQ_RELAXED a request can be sent even when a
+        # reply is still outstanding, and with REQ_CORRELATE the socket drops replies that do not
+        # carry the request-id frame of the latest request.
+        self.socket.setsockopt(zmq.REQ_RELAXED, 1)
+        self.socket.setsockopt(zmq.REQ_CORRELATE, 1)
         self.socket.setsockopt(zmq.RCVTIMEO, self.timeout)
         self.socket.setsockopt_string(zmq.IDENTITY, self.name)
         self.socket.connect(self.address)
@@ -115,16 +153,26 @@ class ClientBase:
 
         self.socket.send(encode(packet))
         try:
-            response = self.socket.recv()
+            ret = decode(self.socket.recv())
         except zmq.error.Again as e:
             logger.exception("Timeout occurred.")
             raise TimeoutError from e
 
-        ret: Packet = decode(response)
+        if ret.reply_to != packet.id:
+            # A reply that does not answer this request is dropped, so it is never returned as
+            # the answer to the next request. A REQ socket cannot receive a
+            # second reply, so the request stays unanswered, exactly as if no reply had come
+            # and without re-sending it: an Operation must never run twice.
+            logger.warning(
+                "Dropping a reply: its reply_to %s does not match the request id %s.", ret.reply_to, packet.id
+            )
+            raise TimeoutError
+
         logger.debug("Response received.")
         logger.debug("Response: %s", str(ret))
         if ret.intent == PacketIntent.ERROR:
-            raise PacketError(str(ret))
+            error_payload = ErrorPayload.model_validate(ret.payload)
+            raise PacketError(error_payload.message, payload=error_payload)
 
         return ret
 
@@ -157,6 +205,7 @@ class InstrumentClientInit(NamedTuple):
     timeout: int
     instrument_name: str
     provider_name: str
+    device_structure: dict[str, Any]
 
 
 class InstrumentClient(ClientBase):
@@ -167,15 +216,11 @@ class InstrumentClient(ClientBase):
 
         self.instrument_name = init_args.instrument_name
         self.provider_name = init_args.provider_name
+        self.device_structure = init_args.device_structure
 
     def trigger_operation(self, operation: str, *args: Any, **kwargs: Any) -> Any:
-        # TODO: Bind positional arguments to their names from the device structure so they can go on the wire.
-        if args:
-            msg = (
-                f"Operation '{operation}' was called with positional arguments {args}. "
-                "Operation arguments must be passed by keyword."
-            )
-            raise TypeError(msg)
+        bound = self._bind_arguments(operation, args, kwargs)
+        kwargs = {name: _dump_argument(value) for name, value in bound.items()}
 
         packet = self.create_control_packet(
             self.provider_name,
@@ -184,7 +229,36 @@ class InstrumentClient(ClientBase):
         )
         response = self.ask(packet)
 
-        return self._response_value(response)
+        return _rebuild_value(self._response_value(response), self._returns_type(operation))
+
+    def _bind_arguments(self, operation: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Bind positional arguments to their names from the Device structure.
+
+        The argument names come from the args_schema's properties, which follow the Operation's
+        signature order.
+        """
+        if not args:
+            return kwargs
+        structure = self.device_structure.get("operations", {}).get(operation)
+        if structure is None:
+            msg = f"Operation '{operation}' has no entry in the device structure, cannot bind positional arguments."
+            raise TypeError(msg)
+        names = list(structure["args_schema"]["properties"])
+        if len(args) > len(names):
+            msg = f"Operation '{operation}' takes at most {len(names)} positional arguments, got {len(args)}."
+            raise TypeError(msg)
+        bound = dict(zip(names, args, strict=False))
+        for name in bound:
+            if name in kwargs:
+                msg = f"Operation '{operation}' got multiple values for argument '{name}'."
+                raise TypeError(msg)
+        bound.update(kwargs)
+        return bound
+
+    def _returns_type(self, operation: str) -> str | None:
+        """Return the type path an Operation's return value rebuilds from, or None when JSON-native."""
+        returns_type: str | None = self.device_structure.get("operations", {}).get(operation, {}).get("returns_type")
+        return returns_type
 
     def trigger_parameter(self, parameter: str, *args: Any, **kwargs: Any) -> Any:
         values = (*args, *kwargs.values())
@@ -196,7 +270,9 @@ class InstrumentClient(ClientBase):
             packet = self.create_control_packet(
                 self.provider_name,
                 Request.SET_PARAMETER,
-                SetParameterPayload(instrument=self.instrument_name, parameter=parameter, value=values[0]).model_dump(),
+                SetParameterPayload(
+                    instrument=self.instrument_name, parameter=parameter, value=_dump_argument(values[0])
+                ).model_dump(),
             )
         else:
             packet = self.create_control_packet(
@@ -207,10 +283,17 @@ class InstrumentClient(ClientBase):
 
         response = self.ask(packet)
 
-        return self._response_value(response)
+        if values:
+            # A SET reply carries no payload, so there is no value to rebuild.
+            return self._response_value(response)
+        return _rebuild_value(self._response_value(response), self._parameter_type(parameter))
+
+    def _parameter_type(self, parameter: str) -> str | None:
+        """Return the type path a Parameter's value rebuilds from, or None when JSON-native."""
+        parameter_type: str | None = self.device_structure.get("parameters", {}).get(parameter, {}).get("type")
+        return parameter_type
 
     def get_info(self) -> Any:
-        # TODO: Rebuild the typed InstrumentInfo from the type path in the device structure.
         packet = self.create_control_packet(
             self.provider_name,
             Request.GET_INFO,
@@ -219,7 +302,12 @@ class InstrumentClient(ClientBase):
 
         response = self.ask(packet)
 
-        return self._response_value(response)
+        return _rebuild_value(self._response_value(response), self._info_type())
+
+    def _info_type(self) -> str | None:
+        """Return the type path the Instrument's info rebuilds from, or None when JSON-native."""
+        info_type: str | None = self.device_structure.get("info", {}).get("type")
+        return info_type
 
     @staticmethod
     def _response_value(response: Packet) -> Any:
@@ -239,7 +327,7 @@ class ProxyInstrumentInit(NamedTuple):
     desc: str
     address: str
     parameters: set[str]
-    operations: dict[str, Callable[[Any], Any]]
+    operations: dict[str, dict[str, Any]]
     client_name: str
 
 
@@ -257,6 +345,10 @@ class ProxyInstrument(Instrument):
     client_name: str = ""
     provider_name: str = "provider1"
     instrument_name: str = "instrument1"
+
+    # The Device structure of the Instrument this proxy mirrors: its Operations' and Parameters'
+    # JSON Schemas and type paths (ADR-0002).
+    device_structure: dict[str, Any] = field(default_factory=dict)
 
     # Boolean used to control when new attributes are being set.
     _instantiating: bool = True
@@ -277,6 +369,7 @@ class ProxyInstrument(Instrument):
             timeout=self.timeout_ms,
             instrument_name=self.name,
             provider_name=self.provider_name,
+            device_structure=self.device_structure,
         )
         self.client = InstrumentClient(instrument_client_init)
 
@@ -361,4 +454,5 @@ class Client(ClientBase):
             provider_name=provider_name,
             parameters=set(response.payload["parameters"]),
             operations=response.payload["operations"],
+            device_structure=response.payload,
         )

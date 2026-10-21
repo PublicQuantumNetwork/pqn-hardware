@@ -3,6 +3,7 @@
 The CLI smoke test in test_cli_smoke.py covers starting the same elements as subprocesses.
 """
 
+import datetime
 import logging
 import socket
 import threading
@@ -13,12 +14,16 @@ from typing import Any
 
 import pytest
 import zmq
+from pydantic import ValidationError
 
+from pqn_hardware.drivers.dummies import DummyInfo
 from pqn_hardware.drivers.dummies import DummyInstrument
 from pqn_hardware.errors import InvalidInstrumentsConfigurationError
+from pqn_hardware.errors import PacketError
 from pqn_hardware.instrument import InstrumentInfo
 from pqn_hardware.network.client import Client
 from pqn_hardware.network.client import ProxyInstrument
+from pqn_hardware.network.client import _dump_argument
 from pqn_hardware.network.instrument_provider import InstrumentProvider
 from pqn_hardware.network.packet import CallOperationPayload
 from pqn_hardware.network.packet import DeviceSummary
@@ -227,6 +232,41 @@ def raw_router() -> Generator[_RawRouter, Any, None]:
     harness.close()
 
 
+MEASURING_PROVIDER_NAME = "pqn_hardware-measuring-provider"
+
+
+@pytest.fixture(scope="module")
+def measuring_network_port() -> int:
+    """Start a Router and a Provider whose Instrument returns a dataclass; return the port."""
+    port = _free_port()
+
+    router = Router(ROUTER_NAME, HOST, port)
+    threading.Thread(target=router.start, daemon=True).start()
+    _wait_until(lambda: router.running, 10, "Router did not start.")
+
+    provider = InstrumentProvider(
+        MEASURING_PROVIDER_NAME,
+        HOST,
+        port,
+        ROUTER_NAME,
+        beat_period=60_000,
+        measuring1={
+            "import": "tests.pytest.test_internal_network._MeasuringInstrument",
+            "desc": "Instrument whose operation returns a dataclass",
+            "hw_address": "1234",
+        },
+        no_info1={
+            "import": "tests.pytest.test_internal_network._NoInfoInstrument",
+            "desc": "Instrument whose info is None",
+            "hw_address": "5678",
+        },
+    )
+    threading.Thread(target=provider.start, daemon=True).start()
+    _wait_until(lambda: MEASURING_PROVIDER_NAME in router.providers, 15, "Measuring provider did not register.")
+
+    return port
+
+
 def _assert_error_reply(reply: Packet, request: Packet, code: ErrorCode, origin: str) -> ErrorPayload:
     """Assert a reply is an error reply with a code and Origin, echoing the request id."""
     assert reply.intent == PacketIntent.ERROR
@@ -311,13 +351,24 @@ def test_proxy_instrument_operation_with_keyword_arguments(network_port: int) ->
     assert proxy_instrument.param_int == half_input_value
 
 
-def test_proxy_instrument_rejects_positional_operation_arguments(network_port: int) -> None:
+def test_proxy_instrument_binds_positional_arguments_to_names(network_port: int) -> None:
     client = _client(network_port)
 
     proxy_instrument = client.get_device(PROVIDER_NAME, "dummy2")
 
-    with pytest.raises(TypeError, match="positional arguments"):
-        proxy_instrument.set_half_input_int(10)
+    # Positional arguments are bound to their names from the Device structure.
+    input_value = 10
+    half_input_value = input_value // 2
+    assert proxy_instrument.set_half_input_int(input_value) == half_input_value
+    assert proxy_instrument.param_int == half_input_value
+
+    # More positional arguments than the Operation takes is a local TypeError.
+    with pytest.raises(TypeError, match="at most 1 positional argument"):
+        proxy_instrument.set_half_input_int(1, 2)
+
+    # A positional argument repeated by keyword is a local TypeError.
+    with pytest.raises(TypeError, match="multiple values for argument 'value'"):
+        proxy_instrument.set_half_input_int(1, value=2)
 
 
 def test_proxy_instrument_rejects_setting_a_parameter_with_more_than_one_value(network_port: int) -> None:
@@ -337,13 +388,790 @@ def test_proxy_instrument_get_info(network_port: int) -> None:
 
     info = proxy_instrument.info
 
-    # The proxy returns the info as a plain dict, not as a DummyInfo.
-    assert info["name"] == "dummy2"
-    assert info["desc"] == "Dummy instrument2 for testing purposes"
-    assert info["hw_address"] == "5678"
+    # The info is rebuilt from the type path in the Device structure, as the same class.
+    assert isinstance(info, DummyInfo)
+    assert info.name == "dummy2"
+    assert info.desc == "Dummy instrument2 for testing purposes"
+    assert info.hw_address == "5678"
     # Order-safe under pytest-randomly: compare against a live read of the same parameters.
-    assert info["param_str"] == proxy_instrument.param_str
-    assert info["param_int"] == proxy_instrument.param_int
+    assert info.param_str == proxy_instrument.param_str
+    assert info.param_int == proxy_instrument.param_int
+
+
+def test_client_survives_a_timeout_and_the_next_request_succeeds(network_port: int) -> None:
+    # The Router drops a Packet addressed to itself, so the ping gets no reply and times out.
+    client = Client(host=HOST, port=network_port, router_name=ROUTER_NAME, timeout=500)
+
+    with pytest.raises(TimeoutError):
+        client.ping(ROUTER_NAME)
+
+    # Without REQ_RELAXED this request's send would raise EFSM; the next request must succeed.
+    response = client.ping(PROVIDER_NAME)
+    assert response is not None
+    assert response.source == PROVIDER_NAME
+    assert response.request == Request.PONG
+
+
+def test_late_reply_is_dropped_not_returned_to_the_next_request(network_port: int) -> None:
+    client = _client(network_port)
+
+    # toggle_bool sleeps ~1.4 s on the Provider; a proxy with a shorter timeout misses the reply.
+    proxy_instrument = client.get_device(PROVIDER_NAME, "dummy2", timeout_ms=500)
+    param_bool_before = proxy_instrument.param_bool
+
+    with pytest.raises(TimeoutError):
+        proxy_instrument.toggle_bool()
+
+    # The late reply arrives while no request is outstanding; it must be dropped, not queued.
+    time.sleep(2)
+    assert proxy_instrument.param_bool == (not param_bool_before)
+
+    # The next request gets its own reply, never the late reply to toggle_bool.
+    input_value = 36
+    half_input_value = input_value // 2
+    assert proxy_instrument.set_half_input_int(input_value) == half_input_value
+
+
+def test_error_reply_raises_packet_error_with_the_error_payload(network_port: int) -> None:
+    client = _client(network_port)
+    try:
+        with pytest.raises(PacketError) as exc_info:
+            client.ping("no-such-destination")
+    finally:
+        # Close the socket while the Client is alive: a Client that only dies by garbage
+        # collection can block another thread's garbage collection in zmq Context.term().
+        client.disconnect()
+
+    error = exc_info.value
+    assert error.code == ErrorCode.UNKNOWN_DESTINATION
+    assert error.origin == ROUTER_NAME
+    assert error.details == {}
+    assert error.message
+
+
+def test_mismatched_reply_to_is_dropped_and_ask_raises_timeout(caplog: pytest.LogCaptureFixture) -> None:
+    # A reply that passes the socket's request-id filter but answers no request of ours: only a
+    # peer that breaks the protocol sends one, so this harness stands in for the Router.
+    port = _free_port()
+    context = zmq.Context()
+    server = context.socket(zmq.ROUTER)
+    server.setsockopt(zmq.ROUTER_HANDOVER, 1)
+    server.bind(f"tcp://{HOST}:{port}")
+
+    seen: dict[str, str] = {}
+
+    def reply(identity: bytes, frame: bytes, request: Packet, reply_to: str | None) -> None:
+        server.send_multipart(
+            [
+                identity,
+                frame,
+                b"",
+                encode(
+                    Packet(
+                        intent=PacketIntent.PING,
+                        request=Request.PONG,
+                        source=PROVIDER_NAME,
+                        destination=request.source,
+                        reply_to=reply_to,
+                    )
+                ),
+            ]
+        )
+
+    def serve() -> None:
+        # Registration: echo the request id, with the captured request-id frame.
+        identity, frame, _, data = server.recv_multipart()
+        registration = decode(data)
+        server.send_multipart(
+            [
+                identity,
+                frame,
+                b"",
+                encode(
+                    Packet(
+                        intent=PacketIntent.REGISTRATION_ACK,
+                        request=Request.ACKNOWLEDGE,
+                        source=ROUTER_NAME,
+                        destination=registration.source,
+                        reply_to=registration.id,
+                    )
+                ),
+            ]
+        )
+
+        # A reply with a null reply_to answers no request either.
+        identity, frame, _, data = server.recv_multipart()
+        reply(identity, frame, decode(data), None)
+
+        # An ERROR reply whose reply_to matches no request of ours: it is dropped like any
+        # other mismatched reply, never raised as the answer to this request.
+        identity, frame, _, data = server.recv_multipart()
+        request = decode(data)
+        seen["ping"] = request.id
+        server.send_multipart(
+            [
+                identity,
+                frame,
+                b"",
+                encode(
+                    Packet(
+                        intent=PacketIntent.ERROR,
+                        request=Request.ERROR,
+                        source=ROUTER_NAME,
+                        destination=request.source,
+                        reply_to="not-the-request-id",
+                        payload=ErrorPayload(
+                            code=ErrorCode.UNKNOWN_DESTINATION, message="a stale error", origin=ROUTER_NAME
+                        ).model_dump(),
+                    )
+                ),
+            ]
+        )
+
+        # The next request gets a reply that answers it.
+        identity, frame, _, data = server.recv_multipart()
+        request = decode(data)
+        reply(identity, frame, request, request.id)
+
+    threading.Thread(target=serve, daemon=True).start()
+
+    client = Client(host=HOST, port=port, router_name=ROUTER_NAME, timeout=1000)
+    try:
+        with (
+            caplog.at_level(logging.WARNING, logger="pqn_hardware.network.client"),
+            pytest.raises(TimeoutError),
+        ):
+            client.ping(PROVIDER_NAME)
+
+        with pytest.raises(TimeoutError):
+            client.ping(PROVIDER_NAME)
+
+        # Each drop warning names the reply's reply_to and the request's id, in that order,
+        # and every drop is a warning, never a louder level.
+        expected = f"its reply_to not-the-request-id does not match the request id {seen['ping']}"
+        assert any(expected in record.message for record in caplog.records)
+        drop_records = [record for record in caplog.records if "does not match the request id" in record.message]
+        assert all(record.levelname == "WARNING" for record in drop_records)
+
+        # The Client survives the dropped replies: the next request succeeds on the same socket.
+        reply_packet = client.ping(PROVIDER_NAME)
+        assert reply_packet is not None
+        assert reply_packet.request == Request.PONG
+        assert reply_packet.reply_to is not None
+    finally:
+        # Close the socket while the Client is alive, so a garbage-collected context can never
+        # block another thread's garbage collection in zmq Context.term().
+        client.disconnect()
+
+    server.close()
+    context.term()
+
+
+def test_error_reply_with_a_null_payload_raises(caplog: pytest.LogCaptureFixture) -> None:
+    # An ERROR reply with a null payload is not a valid error reply: validating it raises, and
+    # the reply is never returned to the caller as a success.
+    port = _free_port()
+    context = zmq.Context()
+    server = context.socket(zmq.ROUTER)
+    server.setsockopt(zmq.ROUTER_HANDOVER, 1)
+    server.bind(f"tcp://{HOST}:{port}")
+
+    def serve() -> None:
+        # Registration: echo the request id, with the captured request-id frame.
+        identity, frame, _, data = server.recv_multipart()
+        registration = decode(data)
+        server.send_multipart(
+            [
+                identity,
+                frame,
+                b"",
+                encode(
+                    Packet(
+                        intent=PacketIntent.REGISTRATION_ACK,
+                        request=Request.ACKNOWLEDGE,
+                        source=ROUTER_NAME,
+                        destination=registration.source,
+                        reply_to=registration.id,
+                    )
+                ),
+            ]
+        )
+
+        # An ERROR Packet that answers the request, but carries no ErrorPayload.
+        identity, frame, _, data = server.recv_multipart()
+        request = decode(data)
+        server.send_multipart(
+            [
+                identity,
+                frame,
+                b"",
+                encode(
+                    Packet(
+                        intent=PacketIntent.ERROR,
+                        request=Request.ERROR,
+                        source=PROVIDER_NAME,
+                        destination=request.source,
+                        reply_to=request.id,
+                        payload=None,
+                    )
+                ),
+            ]
+        )
+
+    threading.Thread(target=serve, daemon=True).start()
+
+    client = Client(host=HOST, port=port, router_name=ROUTER_NAME, timeout=1000)
+    try:
+        with (
+            caplog.at_level(logging.WARNING, logger="pqn_hardware.network.client"),
+            pytest.raises(ValidationError),
+        ):
+            client.ping(PROVIDER_NAME)
+    finally:
+        client.disconnect()
+
+    server.close()
+    context.term()
+
+
+def test_instrument_error_raises_packet_error_with_the_error_payload(network_port: int) -> None:
+    client = _client(network_port)
+
+    proxy_instrument = client.get_device(PROVIDER_NAME, "dummy2")
+    try:
+        with pytest.raises(PacketError) as exc_info:
+            proxy_instrument.fail()
+    finally:
+        proxy_instrument.close()
+        client.disconnect()
+
+    error = exc_info.value
+    # The ErrorPayload's code, origin and details are attributes of the exception.
+    assert error.code == ErrorCode.INSTRUMENT_ERROR
+    assert error.origin == PROVIDER_NAME
+    assert error.details["exception_type"] == "RuntimeError"
+    assert "dummy instrument failure" in error.details["exception"]
+    # The exception carries the ErrorPayload itself, and its message is the Payload's message.
+    assert isinstance(error.payload, ErrorPayload)
+    assert error.payload.code == ErrorCode.INSTRUMENT_ERROR
+    assert error.payload.origin == PROVIDER_NAME
+    assert error.payload.details == error.details
+    assert str(error) == error.payload.message
+
+
+def test_packet_error_without_a_payload_has_no_code_origin_or_details() -> None:
+    error = PacketError("a client-side error")
+
+    assert error.message == "a client-side error"
+    assert error.payload is None
+    assert error.code is None
+    assert error.origin is None
+    assert error.details == {}
+
+
+def test_router_sends_a_stale_reply_without_the_request_id_frame(network_port: int) -> None:
+    # A reply that no longer answers the Client's latest request goes out without the
+    # request-id frame, so the Client's REQ socket drops it; the reply that does answer
+    # it is the only one the socket accepts.
+    context = zmq.Context()
+    socket = context.socket(zmq.REQ)
+    socket.setsockopt(zmq.REQ_RELAXED, 1)
+    socket.setsockopt(zmq.REQ_CORRELATE, 1)
+    socket.setsockopt(zmq.RCVTIMEO, 5000)
+    socket.setsockopt_string(zmq.IDENTITY, "correlated-test-client")
+    socket.connect(f"tcp://{HOST}:{network_port}")
+
+    registration = create_registration_packet(
+        source="correlated-test-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
+    )
+    socket.send(encode(registration))
+    ack = decode(socket.recv())
+    assert ack.intent == PacketIntent.REGISTRATION_ACK
+    assert ack.reply_to == registration.id
+    # The Router sends the acknowledgement: it names itself as the source.
+    assert ack.source == ROUTER_NAME
+    assert ack.destination == "correlated-test-client"
+
+    # A slow request the client does not wait for, then a second request while it runs.
+    toggle = Packet(
+        intent=PacketIntent.CONTROL,
+        request=Request.CALL_OPERATION,
+        source="correlated-test-client",
+        destination=PROVIDER_NAME,
+        payload=CallOperationPayload(instrument="dummy2", operation="toggle_bool").model_dump(),
+    )
+    socket.send(encode(toggle))
+
+    ping = Packet(
+        intent=PacketIntent.PING, request=Request.PING, source="correlated-test-client", destination=PROVIDER_NAME
+    )
+    socket.send(encode(ping))
+
+    # The one reply the socket accepts answers the second request.
+    reply = decode(socket.recv())
+    assert reply.request == Request.PONG
+    assert reply.reply_to == ping.id
+
+    socket.close()
+    context.term()
+
+
+def test_registration_for_another_router_replies_malformed_packet(network_port: int) -> None:
+    # Registering with a Router of another name is a malformed registration: the Router's own
+    # error reply carries the request's id as reply_to, so the Client gets a fast error.
+    context = zmq.Context()
+    socket = context.socket(zmq.REQ)
+    socket.setsockopt(zmq.REQ_RELAXED, 1)
+    socket.setsockopt(zmq.REQ_CORRELATE, 1)
+    socket.setsockopt(zmq.RCVTIMEO, 2000)
+    socket.setsockopt_string(zmq.IDENTITY, "wrong-router-client")
+    socket.connect(f"tcp://{HOST}:{network_port}")
+
+    registration = create_registration_packet(
+        source="wrong-router-client", destination="another-router", kind=NetworkElementClass.CLIENT
+    )
+    socket.send(encode(registration))
+    try:
+        reply = decode(socket.recv())
+
+        assert reply.intent == PacketIntent.ERROR
+        assert reply.reply_to == registration.id
+        # The Router sends the error reply: it names itself as the source.
+        assert reply.source == ROUTER_NAME
+        assert reply.destination == "wrong-router-client"
+        payload = ErrorPayload.model_validate(reply.payload)
+        assert payload.code == ErrorCode.MALFORMED_PACKET
+        assert payload.origin == ROUTER_NAME
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        socket.close()
+        context.term()
+
+
+def test_wrong_frame_count_gets_malformed_packet_and_the_router_keeps_running(network_port: int) -> None:
+    # A message with the wrong frame count gets a fast MALFORMED_PACKET reply, and the Router
+    # keeps serving afterwards.
+    context = zmq.Context()
+    socket = context.socket(zmq.REQ)
+    socket.setsockopt(zmq.RCVTIMEO, 2000)
+    socket.setsockopt_string(zmq.IDENTITY, "bad-frames-client")
+    socket.connect(f"tcp://{HOST}:{network_port}")
+
+    # Register first, so the follow-up request below can be routed back to this client.
+    registration = create_registration_packet(
+        source="bad-frames-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
+    )
+    socket.send(encode(registration))
+    ack = decode(socket.recv())
+    assert ack.intent == PacketIntent.REGISTRATION_ACK
+    # The Router sends the acknowledgement: it names itself as the source.
+    assert ack.source == ROUTER_NAME
+    assert ack.destination == "bad-frames-client"
+    assert ack.reply_to == registration.id
+
+    try:
+        # More frames than any peer sends (the REQ delimiter plus three data frames).
+        socket.send_multipart([b"", b"one", b"two", b"three"])
+        reply = decode(socket.recv())
+
+        assert reply.intent == PacketIntent.ERROR
+        # There is no request id to echo, so the error reply carries a null reply_to.
+        assert reply.reply_to is None
+        # The Router sends the error reply: it names itself as the source.
+        assert reply.source == ROUTER_NAME
+        assert reply.destination == "bad-frames-client"
+        payload = ErrorPayload.model_validate(reply.payload)
+        assert payload.code == ErrorCode.MALFORMED_PACKET
+        assert payload.origin == ROUTER_NAME
+
+        # The Router keeps serving after the bad input.
+        ping = Packet(
+            intent=PacketIntent.PING, request=Request.PING, source="bad-frames-client", destination=PROVIDER_NAME
+        )
+        socket.send(encode(ping))
+        pong = decode(socket.recv())
+        assert pong.request == Request.PONG
+        assert pong.reply_to == ping.id
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        socket.close()
+        context.term()
+
+
+def test_unsolicited_packets_to_a_waiting_client_are_dropped(network_port: int) -> None:
+    # A Packet with no reply_to that the Router forwards to a waiting Client carries no
+    # request-id frame, so the Client's REQ socket drops it: only a reply to its own request
+    # is accepted.
+    context = zmq.Context()
+    waiter = context.socket(zmq.REQ)
+    waiter.setsockopt(zmq.REQ_RELAXED, 1)
+    waiter.setsockopt(zmq.REQ_CORRELATE, 1)
+    waiter.setsockopt(zmq.RCVTIMEO, 5000)
+    waiter.setsockopt_string(zmq.IDENTITY, "waiting-client")
+    waiter.connect(f"tcp://{HOST}:{network_port}")
+
+    registration = create_registration_packet(
+        source="waiting-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
+    )
+    waiter.send(encode(registration))
+    ack = decode(waiter.recv())
+    assert ack.intent == PacketIntent.REGISTRATION_ACK
+
+    # A slow request the waiting client sits on.
+    toggle = Packet(
+        intent=PacketIntent.CONTROL,
+        request=Request.CALL_OPERATION,
+        source="waiting-client",
+        destination=PROVIDER_NAME,
+        payload=CallOperationPayload(instrument="dummy2", operation="toggle_bool").model_dump(),
+    )
+    waiter.send(encode(toggle))
+
+    # While it waits, another client sends a request addressed to the waiting client.
+    sender = context.socket(zmq.REQ)
+    sender.setsockopt(zmq.RCVTIMEO, 2000)
+    sender.setsockopt_string(zmq.IDENTITY, "sending-client")
+    sender.connect(f"tcp://{HOST}:{network_port}")
+    sender_registration = create_registration_packet(
+        source="sending-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
+    )
+    sender.send(encode(sender_registration))
+    assert decode(sender.recv()).intent == PacketIntent.REGISTRATION_ACK
+    unsolicited = Packet(
+        intent=PacketIntent.DATA, request=Request.GET_DEVICES, source="sending-client", destination="waiting-client"
+    )
+    sender.send(encode(unsolicited))
+
+    try:
+        # The only reply the waiting client accepts answers its own slow request.
+        reply = decode(waiter.recv())
+        assert reply.reply_to == toggle.id
+        assert reply.request == Request.CALL_OPERATION
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        waiter.close()
+        sender.close()
+        context.term()
+
+
+def test_dataclass_return_value_is_rebuilt_as_its_class(measuring_network_port: int) -> None:
+    client = Client(host=HOST, port=measuring_network_port, router_name=ROUTER_NAME, timeout=10_000)
+
+    proxy_instrument = client.get_device(MEASURING_PROVIDER_NAME, "measuring1")
+
+    ret = proxy_instrument.measure()
+
+    assert isinstance(ret, _Measurement)
+    assert ret == _Measurement(counts=3)
+
+
+def test_unimportable_type_path_falls_back_to_dict(
+    measuring_network_port: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    client = Client(host=HOST, port=measuring_network_port, router_name=ROUTER_NAME, timeout=10_000)
+
+    proxy_instrument = client.get_device(MEASURING_PROVIDER_NAME, "measuring1")
+    proxy_instrument.client.device_structure["operations"]["measure"]["returns_type"] = "no.such.module.NoSuchType"
+
+    with caplog.at_level(logging.WARNING, logger="pqn_hardware.network.client"):
+        ret = proxy_instrument.measure()
+
+    assert ret == {"counts": 3, "label": "counts"}
+    assert any("no.such.module.NoSuchType" in record.message for record in caplog.records)
+
+
+def test_dataclass_argument_is_dumped_to_json(measuring_network_port: int) -> None:
+    client = Client(host=HOST, port=measuring_network_port, router_name=ROUTER_NAME, timeout=10_000)
+
+    proxy_instrument = client.get_device(MEASURING_PROVIDER_NAME, "measuring1")
+    try:
+        # The dataclass argument is dumped to JSON on the wire and rebuilt on the Provider; only
+        # a rebuilt dataclass carries the counts attribute the Operation reads.
+        counts = 5
+        assert proxy_instrument.record_measurement(_Measurement(counts=counts)) == counts
+
+        # A field explicitly set to None travels as None, not dropped for its default.
+        assert proxy_instrument.record_note_of(_Note(note=None)) is None
+        assert proxy_instrument.record_note_of(_Note(note="kept")) == "kept"
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        proxy_instrument.close()
+        client.disconnect()
+
+
+def test_broken_type_paths_fall_back_to_the_plain_data(
+    measuring_network_port: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    client = Client(host=HOST, port=measuring_network_port, router_name=ROUTER_NAME, timeout=10_000)
+
+    proxy_instrument = client.get_device(MEASURING_PROVIDER_NAME, "measuring1")
+
+    with caplog.at_level(logging.WARNING, logger="pqn_hardware.network.client"):
+        # The module imports but the name is missing: AttributeError.
+        proxy_instrument.client.device_structure["operations"]["measure"]["returns_type"] = (
+            "pqn_hardware.drivers.dummies.NoSuchType"
+        )
+        assert proxy_instrument.measure() == {"counts": 3, "label": "counts"}
+
+        # The path imports but the value fails validation against it: ValidationError.
+        proxy_instrument.client.device_structure["operations"]["labels"]["returns_type"] = (
+            "tests.pytest.test_internal_network._Measurement"
+        )
+        assert proxy_instrument.labels() == ["a", "b"]
+
+        # A path without a dot: ValueError.
+        proxy_instrument.client.device_structure["operations"]["measure"]["returns_type"] = "NoSuchType"
+        assert proxy_instrument.measure() == {"counts": 3, "label": "counts"}
+
+    warnings = [record.message for record in caplog.records]
+    fallbacks = 3
+    assert len(warnings) == fallbacks
+    assert all("returning the plain JSON data instead" in warning for warning in warnings)
+
+
+def test_json_native_return_value_logs_no_rebuild_warning(
+    measuring_network_port: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    client = Client(host=HOST, port=measuring_network_port, router_name=ROUTER_NAME, timeout=10_000)
+
+    proxy_instrument = client.get_device(MEASURING_PROVIDER_NAME, "measuring1")
+
+    # A JSON-native return value has a null type path: it is handed back as it is, with no
+    # rebuild and no rebuild warning.
+    with caplog.at_level(logging.WARNING, logger="pqn_hardware.network.client"):
+        assert proxy_instrument.labels() == ["a", "b"]
+
+    assert caplog.records == []
+
+
+def test_none_info_comes_back_as_none(measuring_network_port: int) -> None:
+    client = Client(host=HOST, port=measuring_network_port, router_name=ROUTER_NAME, timeout=10_000)
+
+    proxy_instrument = client.get_device(MEASURING_PROVIDER_NAME, "no_info1")
+    try:
+        # An Instrument whose info is None reports None, not an empty mapping.
+        assert proxy_instrument.info is None
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        proxy_instrument.close()
+        client.disconnect()
+
+
+def test_dataclass_parameter_round_trips_through_the_proxy(
+    measuring_network_port: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    client = Client(host=HOST, port=measuring_network_port, router_name=ROUTER_NAME, timeout=10_000)
+
+    proxy_instrument = client.get_device(MEASURING_PROVIDER_NAME, "measuring1")
+
+    with caplog.at_level(logging.WARNING, logger="pqn_hardware.network.client"):
+        # Writing an instance dumps it to JSON; reading rebuilds it as the same class.
+        written = _Measurement(counts=7)
+        proxy_instrument.measurement_param = written
+        read_back = proxy_instrument.measurement_param
+
+    assert isinstance(read_back, _Measurement)
+    assert read_back == written
+    # Neither the write nor the read logs a rebuild warning: a SET reply carries no payload,
+    # and the read rebuilds without a fallback.
+    assert caplog.records == []
+
+
+def test_dump_argument_returns_json_data() -> None:
+    stamp = _Stamp(when=datetime.datetime(2026, 10, 16, 12, 0, 0, tzinfo=datetime.UTC))
+
+    # The datetime field is dumped as its JSON data, and default-valued fields are kept.
+    assert _dump_argument(stamp) == {"when": "2026-10-16T12:00:00Z", "label": "kept"}
+    # A dataclass class is not a value: it passes through untouched.
+    assert _dump_argument(_Stamp) is _Stamp
+    # Values that are not dataclasses pass through as they are, dicts included.
+    plain_value = 7
+    assert _dump_argument(plain_value) == plain_value
+    plain_mapping = {"a": 1}
+    assert _dump_argument(plain_mapping) == plain_mapping
+
+
+def test_arguments_and_parameter_values_go_through_json_dumping(
+    measuring_network_port: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dumped: list[Any] = []
+    real_dump = _dump_argument
+
+    def recording_dump(value: Any) -> Any:
+        dumped.append(value)
+        return real_dump(value)
+
+    monkeypatch.setattr("pqn_hardware.network.client._dump_argument", recording_dump)
+
+    client = Client(host=HOST, port=measuring_network_port, router_name=ROUTER_NAME, timeout=10_000)
+    proxy_instrument = client.get_device(MEASURING_PROVIDER_NAME, "measuring1")
+
+    counts = 5
+    assert proxy_instrument.record_measurement(_Measurement(counts=counts)) == counts
+    proxy_instrument.measurement_param = _Measurement(counts=7)
+
+    # Both the Operation argument and the Parameter value are dumped to JSON on the wire.
+    assert _Measurement(counts=5) in dumped
+    assert _Measurement(counts=7) in dumped
+
+
+def test_none_arguments_and_parameter_values_travel(measuring_network_port: int) -> None:
+    client = Client(host=HOST, port=measuring_network_port, router_name=ROUTER_NAME, timeout=10_000)
+
+    proxy_instrument = client.get_device(MEASURING_PROVIDER_NAME, "measuring1")
+
+    # An explicit None argument is sent, not dropped: the driver receives the None.
+    assert proxy_instrument.record_note(None) is None
+    assert proxy_instrument.record_note("note") == "note"
+
+    # Setting a Parameter to None sends the value None, and reading it hands None back.
+    proxy_instrument.note_param = None
+    assert proxy_instrument.note_param is None
+
+
+def test_dict_argument_travels_unchanged(measuring_network_port: int) -> None:
+    client = Client(host=HOST, port=measuring_network_port, router_name=ROUTER_NAME, timeout=10_000)
+
+    proxy_instrument = client.get_device(MEASURING_PROVIDER_NAME, "measuring1")
+    try:
+        # A plain dict argument is not a dataclass: it passes through untouched, and the
+        # Provider receives it unchanged.
+        mapping = {"a": 1}
+        assert proxy_instrument.record_mapping(mapping) == mapping
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        proxy_instrument.close()
+        client.disconnect()
+
+
+def test_setting_a_typed_parameter_to_none_logs_no_rebuild_warning(
+    measuring_network_port: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    client = Client(host=HOST, port=measuring_network_port, router_name=ROUTER_NAME, timeout=10_000)
+
+    proxy_instrument = client.get_device(MEASURING_PROVIDER_NAME, "measuring1")
+    try:
+        # The Parameter publishes the dataclass type path, and its setter also takes None.
+        written = _Measurement(counts=9)
+        proxy_instrument.optional_measurement_param = written
+        assert proxy_instrument.optional_measurement_param == written
+
+        # Setting it to None sends a SET with a null payload: there is no value to rebuild, so
+        # no rebuild warning is logged.
+        with caplog.at_level(logging.WARNING, logger="pqn_hardware.network.client"):
+            proxy_instrument.optional_measurement_param = None
+
+        assert caplog.records == []
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        proxy_instrument.close()
+        client.disconnect()
+
+
+def test_proxy_instrument_binds_two_positional_arguments_in_order(measuring_network_port: int) -> None:
+    client = Client(host=HOST, port=measuring_network_port, router_name=ROUTER_NAME, timeout=10_000)
+
+    proxy_instrument = client.get_device(MEASURING_PROVIDER_NAME, "measuring1")
+
+    # Each positional argument lands on its own name from the Device structure.
+    first = 4
+    second = 2
+    assert proxy_instrument.add(first, second) == first * 10 + second
+
+
+def test_positional_binding_with_a_defaulted_argument(measuring_network_port: int) -> None:
+    client = Client(host=HOST, port=measuring_network_port, router_name=ROUTER_NAME, timeout=10_000)
+
+    proxy_instrument = client.get_device(MEASURING_PROVIDER_NAME, "measuring1")
+
+    # Fewer positionals than the Operation takes: the remaining arguments keep their defaults.
+    value = 3
+    default_factor = 10
+    assert proxy_instrument.scale(value) == value * default_factor
+    # More positionals than required: each lands on its own name, defaulted or not.
+    factor = 2
+    assert proxy_instrument.scale(value, factor) == value * factor
+
+
+def test_mixed_positional_and_keyword_arguments(measuring_network_port: int) -> None:
+    client = Client(host=HOST, port=measuring_network_port, router_name=ROUTER_NAME, timeout=10_000)
+
+    proxy_instrument = client.get_device(MEASURING_PROVIDER_NAME, "measuring1")
+    try:
+        # A positional argument and a keyword argument each land on their own name.
+        first = 1
+        second = 2
+        assert proxy_instrument.add(first, second=second) == first * 10 + second
+
+        # A positional argument with a defaulted keyword argument, and a keyword-only call.
+        value = 3
+        factor = 2
+        assert proxy_instrument.scale(value, factor=factor) == value * factor
+        assert proxy_instrument.scale(value=value, factor=factor) == value * factor
+
+        # An argument passed twice, once positionally and once by keyword, still raises.
+        with pytest.raises(TypeError, match="multiple values for argument 'value'"):
+            proxy_instrument.scale(value, value=value)
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        proxy_instrument.close()
+        client.disconnect()
+
+
+def test_positional_arguments_to_an_operation_missing_from_the_device_structure_raise(network_port: int) -> None:
+    client = _client(network_port)
+
+    proxy_instrument = client.get_device(PROVIDER_NAME, "dummy2")
+    try:
+        with pytest.raises(TypeError, match="no entry in the device structure"):
+            proxy_instrument.client.trigger_operation("no_such_operation", 1)
+    finally:
+        proxy_instrument.close()
+        client.disconnect()
+
+
+def test_zero_argument_call_to_an_operation_missing_from_the_structure_is_sent(network_port: int) -> None:
+    client = _client(network_port)
+
+    proxy_instrument = client.get_device(PROVIDER_NAME, "dummy2")
+    try:
+        # With no positional arguments there is nothing to bind: the request is sent, and the
+        # Provider's UNKNOWN_OPERATION error comes back as a PacketError, not a local TypeError.
+        with pytest.raises(PacketError) as exc_info:
+            proxy_instrument.client.trigger_operation("no_such_operation")
+    finally:
+        proxy_instrument.close()
+        client.disconnect()
+
+    assert exc_info.value.code == ErrorCode.UNKNOWN_OPERATION
+    assert exc_info.value.origin == PROVIDER_NAME
+
+
+def test_proxy_instrument_without_a_device_structure_rejects_positional_arguments(network_port: int) -> None:
+    # A ProxyInstrument built with the default (empty) Device structure binds no positional
+    # arguments: it raises a clean TypeError instead of sending them.
+    proxy_instrument = ProxyInstrument(
+        name="dummy2",
+        host=HOST,
+        port=network_port,
+        router_name=ROUTER_NAME,
+        provider_name=PROVIDER_NAME,
+        instrument_name="dummy2",
+        timeout_ms=10_000,
+    )
+    try:
+        with pytest.raises(TypeError, match="no entry in the device structure"):
+            proxy_instrument.client.trigger_operation("double_int", 1)
+    finally:
+        proxy_instrument.close()
 
 
 def test_error_unknown_instrument(raw_client: _RawClient) -> None:
@@ -972,17 +1800,100 @@ class _Measurement:
     label: str = "counts"
 
 
+@dataclass(frozen=True, slots=True)
+class _Note:
+    """A dataclass argument with a field that may be explicitly None."""
+
+    note: str | None = "unset"
+
+
+@dataclass(frozen=True, slots=True)
+class _Stamp:
+    """A dataclass argument with a field whose python-mode dump is not JSON."""
+
+    when: datetime.datetime
+    label: str = "kept"
+
+
+class _NoInfoInstrument(DummyInstrument):
+    """An Instrument whose info is None, to exercise a null GET_INFO value."""
+
+    @property
+    def info(self) -> None:
+        return None
+
+
 class _MeasuringInstrument(DummyInstrument):
     def __post_init__(self) -> None:
         super().__post_init__()
         self.operations["measure"] = self.measure
         self.operations["labels"] = self.labels
+        self.operations["record_measurement"] = self.record_measurement
+        self.operations["record_mapping"] = self.record_mapping
+        self.operations["record_note_of"] = self.record_note_of
+        self.operations["record_note"] = self.record_note
+        self.operations["add"] = self.add
+        self.operations["scale"] = self.scale
+        self.parameters.update({"measurement_param", "note_param", "optional_measurement_param"})
+        self._measurement_param = _Measurement(counts=0)
+        self._optional_measurement_param = _Measurement(counts=1)
+        self._note: str | None = None
+
+    @property
+    def measurement_param(self) -> _Measurement:
+        return self._measurement_param
+
+    @measurement_param.setter
+    def measurement_param(self, value: _Measurement) -> None:
+        self._measurement_param = value
+
+    @property
+    def optional_measurement_param(self) -> _Measurement:
+        return self._optional_measurement_param
+
+    @optional_measurement_param.setter
+    def optional_measurement_param(self, value: _Measurement | None) -> None:
+        # The setter takes None while the getter still publishes the dataclass type path.
+        self._optional_measurement_param = value
+
+    @property
+    def note_param(self) -> str | None:
+        return self._note
+
+    @note_param.setter
+    def note_param(self, value: str | None) -> None:
+        self._note = value
 
     def measure(self) -> _Measurement:
         return _Measurement(counts=3)
 
     def labels(self) -> list:
         return ["a", "b"]
+
+    def record_measurement(self, measurement: _Measurement) -> int:
+        """Take a dataclass argument; only a rebuilt dataclass has the counts attribute."""
+        return measurement.counts
+
+    def record_note_of(self, value: _Note) -> str | None:
+        """Hand back the dataclass argument's note field, None included."""
+        return value.note
+
+    def record_mapping(self, mapping: dict) -> dict:
+        """Take a plain dict argument, and hand it back unchanged."""
+        return mapping
+
+    def record_note(self, note: str | None) -> str | None:
+        """Take a required argument that may be None, and hand it back."""
+        self._note = note
+        return note
+
+    def add(self, first: int, second: int) -> int:
+        """Take two arguments, so a test can check that each lands on the right name."""
+        return first * 10 + second
+
+    def scale(self, value: int, factor: int = 10) -> int:
+        """Take a required and a defaulted argument, to exercise partial positional binding."""
+        return value * factor
 
 
 @dataclass(frozen=True, slots=True)
