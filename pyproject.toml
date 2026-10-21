@@ -5,7 +5,7 @@ build-backend = "uv_build"
 
 [project]
 name = "pqn-hardware"
-version = "0.2.0"
+version = "0.3.0"
 description = "Hardware control library for the Public Quantum Network."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -29,7 +29,7 @@ pqn-hw = "pqn_hardware.cli:app"
 
 
 [dependency-groups]
-dev = ["hypothesis", "mypy", "coverage", "pytest-randomly", "ruff"]
+dev = ["hypothesis", "mypy", "coverage", "pytest-randomly", "ruff", "jsonschema>=4.26.0"]
 
 
 [tool.mypy]

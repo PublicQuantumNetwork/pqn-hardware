@@ -173,11 +173,12 @@ def encode(packet: Packet) -> bytes:
 def decode(data: bytes) -> Packet:
     """Decode wire bytes into a Packet. Raises if the bytes are not a valid Packet."""
     packet = Packet.model_validate_json(data)
-    # A missing version on the wire fails validation: the model default only keeps local
-    # construction simple, so the wire always carries the version explicitly.
-    if "version" not in packet.model_fields_set:
-        title = "Packet"
-        raise ValidationError.from_exception_data(title, [{"type": "missing", "loc": ("version",), "input": data}])
+    # A missing version or id on the wire fails validation: the model defaults only
+    # keep local construction simple, so the wire always carries both fields explicitly.
+    for missing in ("version", "id"):
+        if missing not in packet.model_fields_set:
+            title = "Packet"
+            raise ValidationError.from_exception_data(title, [{"type": "missing", "loc": (missing,), "input": data}])
     return packet
 
 

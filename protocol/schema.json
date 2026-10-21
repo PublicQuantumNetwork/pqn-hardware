@@ -1,0 +1,492 @@
+{
+  "enums": {
+    "ErrorCode": {
+      "description": "Stable, machine-readable identifier in an error Payload.\n\nPeers branch on the code, never on the message text.",
+      "enum": [
+        "UNKNOWN_DESTINATION",
+        "DESTINATION_UNREACHABLE",
+        "MALFORMED_PACKET",
+        "UNSUPPORTED_VERSION",
+        "UNSUPPORTED_REQUEST",
+        "WRONG_DESTINATION",
+        "UNKNOWN_INSTRUMENT",
+        "UNKNOWN_OPERATION",
+        "UNKNOWN_PARAMETER",
+        "INVALID_ARGUMENTS",
+        "INSTRUMENT_ERROR"
+      ],
+      "title": "ErrorCode",
+      "type": "string"
+    },
+    "NetworkElementClass": {
+      "description": "The kind of network element registering with a Router.",
+      "enum": [
+        "PROVIDER",
+        "CLIENT"
+      ],
+      "title": "NetworkElementClass",
+      "type": "string"
+    },
+    "PacketIntent": {
+      "description": "The category of a Packet, which decides how the receiver handles it.",
+      "enum": [
+        "DATA",
+        "CONTROL",
+        "REGISTRATION",
+        "REGISTRATION_ACK",
+        "PING",
+        "ERROR"
+      ],
+      "title": "PacketIntent",
+      "type": "string"
+    },
+    "Request": {
+      "description": "The verb naming what a Packet asks for. Each verb has one Payload shape.",
+      "enum": [
+        "REGISTER",
+        "ACKNOWLEDGE",
+        "PING",
+        "PONG",
+        "GET_PROVIDERS",
+        "GET_DEVICES",
+        "GET_DEVICE_STRUCTURE",
+        "CALL_OPERATION",
+        "GET_PARAMETER",
+        "SET_PARAMETER",
+        "GET_INFO",
+        "ERROR"
+      ],
+      "title": "Request",
+      "type": "string"
+    }
+  },
+  "envelope": {
+    "$defs": {
+      "PacketIntent": {
+        "description": "The category of a Packet, which decides how the receiver handles it.",
+        "enum": [
+          "DATA",
+          "CONTROL",
+          "REGISTRATION",
+          "REGISTRATION_ACK",
+          "PING",
+          "ERROR"
+        ],
+        "title": "PacketIntent",
+        "type": "string"
+      },
+      "Request": {
+        "description": "The verb naming what a Packet asks for. Each verb has one Payload shape.",
+        "enum": [
+          "REGISTER",
+          "ACKNOWLEDGE",
+          "PING",
+          "PONG",
+          "GET_PROVIDERS",
+          "GET_DEVICES",
+          "GET_DEVICE_STRUCTURE",
+          "CALL_OPERATION",
+          "GET_PARAMETER",
+          "SET_PARAMETER",
+          "GET_INFO",
+          "ERROR"
+        ],
+        "title": "Request",
+        "type": "string"
+      }
+    },
+    "description": "The single message envelope on the wire. The Payload shape is fixed by `request`.",
+    "properties": {
+      "destination": {
+        "title": "Destination",
+        "type": "string"
+      },
+      "hops": {
+        "default": 0,
+        "title": "Hops",
+        "type": "integer"
+      },
+      "id": {
+        "title": "Id",
+        "type": "string"
+      },
+      "intent": {
+        "$ref": "#/$defs/PacketIntent"
+      },
+      "payload": {
+        "anyOf": [
+          {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Payload"
+      },
+      "reply_to": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Reply To"
+      },
+      "request": {
+        "$ref": "#/$defs/Request"
+      },
+      "source": {
+        "title": "Source",
+        "type": "string"
+      },
+      "version": {
+        "default": 2,
+        "title": "Version",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "destination",
+      "id",
+      "intent",
+      "request",
+      "source",
+      "version"
+    ],
+    "title": "Packet",
+    "type": "object"
+  },
+  "payloads": {
+    "CallOperationPayload": {
+      "description": "Payload of a CALL_OPERATION Packet. Arguments go by keyword only.",
+      "properties": {
+        "instrument": {
+          "title": "Instrument",
+          "type": "string"
+        },
+        "kwargs": {
+          "additionalProperties": true,
+          "title": "Kwargs",
+          "type": "object"
+        },
+        "operation": {
+          "title": "Operation",
+          "type": "string"
+        }
+      },
+      "required": [
+        "instrument",
+        "operation"
+      ],
+      "title": "CallOperationPayload",
+      "type": "object"
+    },
+    "DevicesPayload": {
+      "$defs": {
+        "DeviceSummary": {
+          "description": "Summary of one Instrument a Provider reports, by its driver's import path.",
+          "properties": {
+            "desc": {
+              "title": "Desc",
+              "type": "string"
+            },
+            "hw_address": {
+              "title": "Hw Address",
+              "type": "string"
+            },
+            "type": {
+              "title": "Type",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "desc",
+            "hw_address"
+          ],
+          "title": "DeviceSummary",
+          "type": "object"
+        }
+      },
+      "description": "Payload of a GET_DEVICES reply.",
+      "properties": {
+        "devices": {
+          "additionalProperties": {
+            "$ref": "#/$defs/DeviceSummary"
+          },
+          "title": "Devices",
+          "type": "object"
+        }
+      },
+      "required": [
+        "devices"
+      ],
+      "title": "DevicesPayload",
+      "type": "object"
+    },
+    "ErrorPayload": {
+      "$defs": {
+        "ErrorCode": {
+          "description": "Stable, machine-readable identifier in an error Payload.\n\nPeers branch on the code, never on the message text.",
+          "enum": [
+            "UNKNOWN_DESTINATION",
+            "DESTINATION_UNREACHABLE",
+            "MALFORMED_PACKET",
+            "UNSUPPORTED_VERSION",
+            "UNSUPPORTED_REQUEST",
+            "WRONG_DESTINATION",
+            "UNKNOWN_INSTRUMENT",
+            "UNKNOWN_OPERATION",
+            "UNKNOWN_PARAMETER",
+            "INVALID_ARGUMENTS",
+            "INSTRUMENT_ERROR"
+          ],
+          "title": "ErrorCode",
+          "type": "string"
+        }
+      },
+      "description": "Payload of an ERROR Packet. The Origin is the element that raised the error.",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/ErrorCode"
+        },
+        "details": {
+          "additionalProperties": true,
+          "title": "Details",
+          "type": "object"
+        },
+        "message": {
+          "title": "Message",
+          "type": "string"
+        },
+        "origin": {
+          "title": "Origin",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "origin"
+      ],
+      "title": "ErrorPayload",
+      "type": "object"
+    },
+    "GetDeviceStructurePayload": {
+      "description": "Payload of a GET_DEVICE_STRUCTURE Packet.",
+      "properties": {
+        "instrument": {
+          "title": "Instrument",
+          "type": "string"
+        }
+      },
+      "required": [
+        "instrument"
+      ],
+      "title": "GetDeviceStructurePayload",
+      "type": "object"
+    },
+    "GetInfoPayload": {
+      "description": "Payload of a GET_INFO Packet.",
+      "properties": {
+        "instrument": {
+          "title": "Instrument",
+          "type": "string"
+        }
+      },
+      "required": [
+        "instrument"
+      ],
+      "title": "GetInfoPayload",
+      "type": "object"
+    },
+    "GetParameterPayload": {
+      "description": "Payload of a GET_PARAMETER Packet.",
+      "properties": {
+        "instrument": {
+          "title": "Instrument",
+          "type": "string"
+        },
+        "parameter": {
+          "title": "Parameter",
+          "type": "string"
+        }
+      },
+      "required": [
+        "instrument",
+        "parameter"
+      ],
+      "title": "GetParameterPayload",
+      "type": "object"
+    },
+    "ProvidersPayload": {
+      "$defs": {
+        "DeviceSummary": {
+          "description": "Summary of one Instrument a Provider reports, by its driver's import path.",
+          "properties": {
+            "desc": {
+              "title": "Desc",
+              "type": "string"
+            },
+            "hw_address": {
+              "title": "Hw Address",
+              "type": "string"
+            },
+            "type": {
+              "title": "Type",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "desc",
+            "hw_address"
+          ],
+          "title": "DeviceSummary",
+          "type": "object"
+        },
+        "ProviderSummary": {
+          "description": "Summary of one Provider in the Router's Directory, by its Last seen time and devices.",
+          "properties": {
+            "devices": {
+              "additionalProperties": {
+                "$ref": "#/$defs/DeviceSummary"
+              },
+              "title": "Devices",
+              "type": "object"
+            },
+            "last_seen": {
+              "format": "date-time",
+              "title": "Last Seen",
+              "type": "string"
+            },
+            "name": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "last_seen",
+            "devices"
+          ],
+          "title": "ProviderSummary",
+          "type": "object"
+        }
+      },
+      "description": "Payload of a GET_PROVIDERS reply.",
+      "properties": {
+        "providers": {
+          "items": {
+            "$ref": "#/$defs/ProviderSummary"
+          },
+          "title": "Providers",
+          "type": "array"
+        }
+      },
+      "required": [
+        "providers"
+      ],
+      "title": "ProvidersPayload",
+      "type": "object"
+    },
+    "RegisterPayload": {
+      "$defs": {
+        "DeviceSummary": {
+          "description": "Summary of one Instrument a Provider reports, by its driver's import path.",
+          "properties": {
+            "desc": {
+              "title": "Desc",
+              "type": "string"
+            },
+            "hw_address": {
+              "title": "Hw Address",
+              "type": "string"
+            },
+            "type": {
+              "title": "Type",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "desc",
+            "hw_address"
+          ],
+          "title": "DeviceSummary",
+          "type": "object"
+        },
+        "NetworkElementClass": {
+          "description": "The kind of network element registering with a Router.",
+          "enum": [
+            "PROVIDER",
+            "CLIENT"
+          ],
+          "title": "NetworkElementClass",
+          "type": "string"
+        }
+      },
+      "description": "Payload of a REGISTER Packet. Only Providers report devices.",
+      "properties": {
+        "devices": {
+          "additionalProperties": {
+            "$ref": "#/$defs/DeviceSummary"
+          },
+          "title": "Devices",
+          "type": "object"
+        },
+        "kind": {
+          "$ref": "#/$defs/NetworkElementClass"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "RegisterPayload",
+      "type": "object"
+    },
+    "SetParameterPayload": {
+      "description": "Payload of a SET_PARAMETER Packet.",
+      "properties": {
+        "instrument": {
+          "title": "Instrument",
+          "type": "string"
+        },
+        "parameter": {
+          "title": "Parameter",
+          "type": "string"
+        },
+        "value": {
+          "title": "Value"
+        }
+      },
+      "required": [
+        "instrument",
+        "parameter",
+        "value"
+      ],
+      "title": "SetParameterPayload",
+      "type": "object"
+    },
+    "ValuePayload": {
+      "description": "Payload of CALL_OPERATION, GET_PARAMETER and GET_INFO replies.",
+      "properties": {
+        "value": {
+          "title": "Value"
+        }
+      },
+      "required": [
+        "value"
+      ],
+      "title": "ValuePayload",
+      "type": "object"
+    }
+  },
+  "protocol_version": 2
+}

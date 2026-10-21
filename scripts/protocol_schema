@@ -1,0 +1,154 @@
+#!/usr/bin/env python
+"""Generate and check protocol/schema.json, the committed spec of the JSON wire protocol.
+
+The schema is generated from the pydantic models in pqn_hardware.network.packet, never
+hand-written, so it always matches the code (ADR-0001). Modes:
+
+- check (default): fail when regenerating the schema changes the committed file (a stale schema).
+- generate: write the schema to the committed path.
+- check-version: fail when the committed schema differs from origin/master's without a
+  PROTOCOL_VERSION bump. A missing or empty old schema means master has none, so the
+  check passes.
+"""
+
+import argparse
+import json
+import sys
+from collections.abc import Sequence
+from enum import StrEnum
+from pathlib import Path
+from typing import Any
+
+from pydantic import BaseModel
+from pydantic import TypeAdapter
+
+from pqn_hardware.network import packet
+from pqn_hardware.network.packet import PROTOCOL_VERSION
+
+SCHEMA_PATH = Path(__file__).resolve().parents[1] / "protocol" / "schema.json"
+
+
+def _report(message: str) -> None:
+    """Print a check result for humans and CI logs."""
+    print(message)  # noqa: T201 - CLI output
+
+
+def _fail(message: str) -> None:
+    """Print a failure for humans and CI logs."""
+    print(message, file=sys.stderr)  # noqa: T201 - CLI output
+
+
+def _payload_models() -> list[type[BaseModel]]:
+    """Every Payload model defined in packet.py, by name (one per Request verb, plus ErrorPayload)."""
+    models = [
+        obj
+        for obj in vars(packet).values()
+        if isinstance(obj, type)
+        and issubclass(obj, BaseModel)
+        and obj.__module__ == packet.__name__
+        and obj.__name__.endswith("Payload")
+    ]
+    return sorted(models, key=lambda model: model.__name__)
+
+
+def _enum_models() -> list[type[StrEnum]]:
+    """Every enum defined in packet.py, by name."""
+    enums = [
+        obj
+        for obj in vars(packet).values()
+        if isinstance(obj, type) and issubclass(obj, StrEnum) and obj.__module__ == packet.__name__
+    ]
+    return sorted(enums, key=lambda enum: enum.__name__)
+
+
+def generate_schema() -> dict[str, Any]:
+    """Build the protocol schema document from the wire models in packet.py."""
+    envelope = packet.Packet.model_json_schema()
+    # version and id are required on the wire even though the Packet model keeps defaults for
+    # local construction; pydantic does not mark defaulted fields required.
+    envelope["required"] = sorted({*envelope.get("required", []), "version", "id"})
+    return {
+        "protocol_version": PROTOCOL_VERSION,
+        "envelope": envelope,
+        "payloads": {model.__name__: model.model_json_schema() for model in _payload_models()},
+        "enums": {enum.__name__: TypeAdapter(enum).json_schema() for enum in _enum_models()},
+    }
+
+
+def render_schema(document: dict[str, Any]) -> str:
+    """Render the schema document deterministically: sorted keys, fixed indent, trailing newline."""
+    return json.dumps(document, indent=2, sort_keys=True) + "\n"
+
+
+def generate(schema_path: Path) -> int:
+    """Write the schema document to the committed path."""
+    schema_path.parent.mkdir(parents=True, exist_ok=True)
+    schema_path.write_text(render_schema(generate_schema()), encoding="utf-8")
+    _report(f"Wrote {schema_path} (protocol version {PROTOCOL_VERSION}).")
+    return 0
+
+
+def check(schema_path: Path) -> int:
+    """Fail when regenerating the schema changes the committed file."""
+    if not schema_path.exists():
+        _fail(f"{schema_path} does not exist; run 'generate' to create it.")
+        return 1
+    if schema_path.read_text(encoding="utf-8") != render_schema(generate_schema()):
+        _fail(f"{schema_path} is stale; regenerate it and commit the result.")
+        return 1
+    _report(f"{schema_path} is up to date (protocol version {PROTOCOL_VERSION}).")
+    return 0
+
+
+def check_version(schema_path: Path, old_schema_path: Path) -> int:
+    """Fail when the schema differs from master's without a PROTOCOL_VERSION bump."""
+    if not old_schema_path.exists() or not old_schema_path.read_text(encoding="utf-8").strip():
+        # Master has no protocol schema yet: there is nothing to compare.
+        _report("No protocol schema on master; the version check passes.")
+        return 0
+    old = json.loads(old_schema_path.read_text(encoding="utf-8"))
+    new = json.loads(schema_path.read_text(encoding="utf-8"))
+    if old == new:
+        _report(f"The protocol schema is unchanged from master (protocol version {new['protocol_version']}).")
+        return 0
+    old_version = old.get("protocol_version")
+    new_version = new.get("protocol_version")
+    if isinstance(old_version, int) and isinstance(new_version, int) and new_version > old_version:
+        _report(f"The protocol schema changed and PROTOCOL_VERSION went from {old_version} to {new_version}.")
+        return 0
+    _fail(
+        f"The protocol schema differs from master without a PROTOCOL_VERSION bump "
+        f"(master {old_version}, this branch {new_version}); bump PROTOCOL_VERSION in packet.py."
+    )
+    return 1
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--schema", type=Path, default=SCHEMA_PATH, help="The committed schema path (default: %(default)s)."
+    )
+    subparsers = parser.add_subparsers(dest="command")
+    subparsers.add_parser("generate", help="Write the schema to the committed path.")
+    subparsers.add_parser("check", help="Fail when regenerating the schema changes the committed file.")
+    check_version_parser = subparsers.add_parser(
+        "check-version", help="Compare the committed schema with master's."
+    )
+    check_version_parser.add_argument(
+        "--old-schema",
+        type=Path,
+        required=True,
+        help="The schema read from origin/master; a missing or empty file means master has none.",
+    )
+    args = parser.parse_args(argv)
+    if args.command == "generate":
+        return generate(args.schema)
+    if args.command == "check":
+        return check(args.schema)
+    if args.command == "check-version":
+        return check_version(args.schema, args.old_schema)
+    return check(args.schema)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

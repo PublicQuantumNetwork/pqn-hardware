@@ -53,6 +53,14 @@ uv run pqn-hw start-provider \
 
 See [`configs/config_messaging_example.toml`](configs/config_example.toml) for the full config shape.
 
+## Wire protocol
+
+Network elements exchange **Packets** as JSON over ZMQ, pinned by a protocol version (currently 2). The authoritative spec is the committed JSON Schema, [`protocol/schema.json`](protocol/schema.json): the envelope, every request Payload, the error Payload and the enums. Non-Python peers implement against that file.
+
+After changing any wire model in `pqn_hardware/network/packet.py`, regenerate the schema with `uv run scripts/protocol_schema generate` and bump `PROTOCOL_VERSION`. CI fails a PR whose committed schema is stale, or that changes the schema without a `PROTOCOL_VERSION` bump.
+
+**Breaking change (v0.3.0):** the wire moved from pickle to JSON (protocol version 1 to 2). A v1 peer and a v2 peer cannot talk to each other, so the Router, all Providers and all Clients must be upgraded together.
+
 ## Consuming from pqn-node
 
 `pqn-node` depends on this package via a git URL pinned to a tag or commit:
