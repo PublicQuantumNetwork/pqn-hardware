@@ -30,6 +30,12 @@ class Router:
         self.providers: dict[str, bytes] = {}
         self.clients: dict[str, bytes] = {}
 
+        # Per Client identity, the latest request-id frame its REQ socket sent (REQ_CORRELATE)
+        # and the id of that request Packet. A reply whose reply_to matches that id is sent
+        # back with the request-id frame; any other Packet to the Client goes without it, so
+        # the Client's socket drops it.
+        self.request_ids: dict[bytes, tuple[bytes, str]] = {}
+
         self.context: zmq.Context[zmq.Socket[bytes]] | None = None
         self.socket: zmq.Socket[bytes] | None = None
         self.running = False
@@ -65,7 +71,10 @@ class Router:
     def handle_registration(self, identity_binary: bytes, packet: Packet) -> None:
         if packet.destination != self.name:
             self.handle_packet_error(
-                identity_binary, ErrorCode.MALFORMED_PACKET, f"Router {self.name} is not the destination"
+                identity_binary,
+                ErrorCode.MALFORMED_PACKET,
+                f"Router {self.name} is not the destination",
+                reply_to=packet.id,
             )
             return
         payload = RegisterPayload.model_validate(packet.payload)
@@ -82,6 +91,7 @@ class Router:
             request=Request.ACKNOWLEDGE,
             source=self.name,
             destination=identity_binary.decode("utf-8"),
+            reply_to=packet.id,
         )
         self._send(identity_binary, ack_packet)
 
@@ -96,7 +106,10 @@ class Router:
             dest = self.providers.get(packet.destination) or self.clients.get(packet.destination)
             if dest is None:
                 self.handle_packet_error(
-                    identity_binary, ErrorCode.UNKNOWN_DESTINATION, f"Destination {packet.destination} not found."
+                    identity_binary,
+                    ErrorCode.UNKNOWN_DESTINATION,
+                    f"Destination {packet.destination} not found.",
+                    reply_to=packet.id,
                 )
                 return
             self._send(dest, forward_packet)
@@ -105,7 +118,12 @@ class Router:
         else:
             logger.info("Packet destination is not a provider will ask other routers in system")
             # FIXME: This is temporary and should be replaced with the routing algorithm.
-            self.handle_packet_error(identity_binary, ErrorCode.UNKNOWN_DESTINATION, "Routing not implemented yet.")
+            self.handle_packet_error(
+                identity_binary,
+                ErrorCode.UNKNOWN_DESTINATION,
+                "Routing not implemented yet.",
+                reply_to=packet.id,
+            )
 
     def listen(self) -> tuple[bytes, Packet] | tuple[None, None]:
         # This should never happen, but mypy complains if the check is not done
@@ -114,22 +132,30 @@ class Router:
             logger.error(msg)
             raise RuntimeError(msg)
 
-        # Depending on who is sending a request, the number of items received will be different. This is not
-        # DEALER sockets send 2 items, REQ sockets send an empty delimiter.
+        # Depending on who is sending a request, the number of items received will be different.
+        # DEALER sockets send 2 items, REQ sockets send an empty delimiter, and a REQ socket with
+        # REQ_CORRELATE also sends its request-id frame.
         dealer_parts = 2
         req_parts = 3
+        correlated_parts = 4
+        request_id: bytes | None = None
         request = self.socket.recv_multipart()
         if len(request) == dealer_parts:
             identity_binary, data = request
         elif len(request) == req_parts:
             identity_binary, _, data = request
+        elif len(request) == correlated_parts:
+            identity_binary, request_id, _, data = request
         else:
             self.handle_packet_error(
-                request[0], ErrorCode.MALFORMED_PACKET, f"Requests can only have 2 or 3 parts, not {len(request)}"
+                request[0], ErrorCode.MALFORMED_PACKET, f"Requests can only have 2, 3 or 4 parts, not {len(request)}"
             )
             return None, None
 
         packet = decode(data)
+        if request_id is not None:
+            # Only the latest request-id frame and request id of each Client is remembered.
+            self.request_ids[identity_binary] = (request_id, packet.id)
         logger.info("Received packet from %s: %s", identity_binary, packet)
         return identity_binary, packet
 
@@ -141,16 +167,25 @@ class Router:
             raise RuntimeError(msg)
 
         logger.info("Sending packet to %s | Packet: %s", packet.destination, packet)
-        self.socket.send_multipart([destination, b"", encode(packet)])
+        frames = [destination, b"", encode(packet)]
+        # A reply to a Client's latest request carries its request-id frame back, so the Client's
+        # REQ socket accepts it; any other Packet goes without it, so the socket drops it.
+        remembered = self.request_ids.get(destination)
+        if remembered is not None and packet.reply_to == remembered[1]:
+            frames.insert(1, remembered[0])
+        self.socket.send_multipart(frames)
         logger.info("Packet sent to %s", packet.destination)
 
-    def handle_packet_error(self, destination: bytes, code: ErrorCode, message: str) -> None:
+    def handle_packet_error(
+        self, destination: bytes, code: ErrorCode, message: str, reply_to: str | None = None
+    ) -> None:
         logger.error(message)
         error_packet = Packet(
             intent=PacketIntent.ERROR,
             request=Request.ERROR,
             source=self.name,
             destination=destination.decode("utf-8"),
+            reply_to=reply_to,
             payload=ErrorPayload(code=code, message=message, origin=self.name).model_dump(),
         )
         self._send(destination, error_packet)
