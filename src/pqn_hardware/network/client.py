@@ -26,6 +26,8 @@ from pqn_hardware.network.packet import GetParameterPayload
 from pqn_hardware.network.packet import NetworkElementClass
 from pqn_hardware.network.packet import Packet
 from pqn_hardware.network.packet import PacketIntent
+from pqn_hardware.network.packet import ProvidersPayload
+from pqn_hardware.network.packet import ProviderSummary
 from pqn_hardware.network.packet import Request
 from pqn_hardware.network.packet import SetParameterPayload
 from pqn_hardware.network.packet import create_registration_packet
@@ -424,6 +426,15 @@ class Client(ClientBase):
         devices = DevicesPayload.model_validate(response.payload)
 
         return devices.devices
+
+    def get_providers(self) -> dict[str, ProviderSummary]:
+        """List every Provider in the Router's Directory, keyed by name, with its Last seen and devices."""
+        packet = self.create_data_packet(self.router_name, Request.GET_PROVIDERS, None)
+        response = self.ask(packet)
+
+        providers = ProvidersPayload.model_validate(response.payload)
+
+        return {provider.name: provider for provider in providers.providers}
 
     def get_device(self, provider_name: str, device_name: str, timeout_ms: int = 60_000) -> Instrument:
         packet = self.create_data_packet(

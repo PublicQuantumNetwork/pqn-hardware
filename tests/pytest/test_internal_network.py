@@ -10,14 +10,18 @@ import re
 import socket
 import threading
 import time
+from collections.abc import Callable
 from collections.abc import Generator
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import pytest
 import zmq
 from pydantic import ValidationError
 
+from pqn_hardware.cli import _load_and_parse_router_config
+from pqn_hardware.cli import start_router
 from pqn_hardware.drivers.dummies import DummyInfo
 from pqn_hardware.drivers.dummies import DummyInstrument
 from pqn_hardware.errors import InvalidInstrumentsConfigurationError
@@ -44,6 +48,8 @@ from pqn_hardware.network.packet import SetParameterPayload
 from pqn_hardware.network.packet import create_registration_packet
 from pqn_hardware.network.packet import decode
 from pqn_hardware.network.packet import encode
+from pqn_hardware.network.router import ZMQ_HEARTBEAT_IVL
+from pqn_hardware.network.router import ZMQ_HEARTBEAT_TIMEOUT
 from pqn_hardware.network.router import Router
 
 logger = logging.getLogger(__name__)
@@ -69,6 +75,22 @@ def _wait_until(condition: Any, timeout_s: float, failure_msg: str) -> None:
         if time.monotonic() > deadline:
             raise TimeoutError(failure_msg)
         time.sleep(0.01)
+
+
+def _stop_router(router: Router) -> None:
+    """Stop a Router started in a test: wake its loop with a message and wait for its socket to close."""
+    router.running = False
+    context = zmq.Context()
+    poker = context.socket(zmq.DEALER)
+    poker.connect(router.address)
+    try:
+        poker.send(b"stop")
+        _wait_until(lambda: router.socket is not None and router.socket.closed, 10, "Router did not stop.")
+    finally:
+        # The poke is discarded if the Router is already gone: waiting for it to transfer
+        # would hang the teardown.
+        poker.close(linger=0)
+        context.term()
 
 
 @pytest.fixture(scope="module")
@@ -97,7 +119,7 @@ def network_port() -> int:
         },
     )
     threading.Thread(target=provider.start, daemon=True).start()
-    _wait_until(lambda: PROVIDER_NAME in router.providers, 15, "InstrumentProvider did not register with the Router.")
+    _wait_until(lambda: PROVIDER_NAME in router.directory, 15, "InstrumentProvider did not register with the Router.")
 
     logger.debug("Router and InstrumentProvider are up on port %s", port)
     return port
@@ -265,7 +287,7 @@ def measuring_network_port() -> int:
         },
     )
     threading.Thread(target=provider.start, daemon=True).start()
-    _wait_until(lambda: MEASURING_PROVIDER_NAME in router.providers, 15, "Measuring provider did not register.")
+    _wait_until(lambda: MEASURING_PROVIDER_NAME in router.directory, 15, "Measuring provider did not register.")
 
     return port
 
@@ -416,17 +438,36 @@ def test_proxy_instrument_get_info(network_port: int) -> None:
 
 
 def test_client_survives_a_timeout_and_the_next_request_succeeds(network_port: int) -> None:
-    # The Router drops a Packet addressed to itself, so the ping gets no reply and times out.
+    # A silent destination: a connected Provider stand-in that never answers, so the ping
+    # gets no reply at all and the Client times out.
+    context = zmq.Context()
+    silent = context.socket(zmq.DEALER)
+    silent.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+    silent.setsockopt_string(zmq.IDENTITY, "silent-provider")
+    silent.connect(f"tcp://{HOST}:{network_port}")
+    registration = create_registration_packet(
+        source="silent-provider", destination=ROUTER_NAME, kind=NetworkElementClass.PROVIDER
+    )
+    silent.send(encode(registration))
+    _, ack_data = silent.recv_multipart()
+    _assert_registration_ack(decode(ack_data), registration)
+
     client = Client(host=HOST, port=network_port, router_name=ROUTER_NAME, timeout=500)
+    try:
+        with pytest.raises(TimeoutError):
+            client.ping("silent-provider")
 
-    with pytest.raises(TimeoutError):
-        client.ping(ROUTER_NAME)
-
-    # Without REQ_RELAXED this request's send would raise EFSM; the next request must succeed.
-    response = client.ping(PROVIDER_NAME)
-    assert response is not None
-    assert response.source == PROVIDER_NAME
-    assert response.request == Request.PONG
+        # Without REQ_RELAXED this request's send would raise EFSM; the next request must succeed.
+        response = client.ping(PROVIDER_NAME)
+        assert response is not None
+        assert response.source == PROVIDER_NAME
+        assert response.request == Request.PONG
+    finally:
+        # Close the sockets while the Client is alive: a Client that only dies by garbage
+        # collection can block another thread's garbage collection in zmq Context.term().
+        client.disconnect()
+        silent.close()
+        context.term()
 
 
 def test_late_reply_is_dropped_not_returned_to_the_next_request(network_port: int) -> None:
@@ -869,8 +910,11 @@ def test_garbage_bytes_from_a_dealer_with_a_non_utf8_identity_get_malformed_pack
     network_port: int, identity: bytes | None
 ) -> None:
     # A DEALER whose identity frame is not UTF-8 text: libzmq's auto identity when none is
-    # set (binary in all but a few random cases), or an explicit binary identity. The Router
-    # never crashes on either, and the error reply still arrives on that socket.
+    # set (binary in all but a few random cases), or an explicit binary identity. No Packet's
+    # source can ever match such an identity frame, so every valid Packet it sends is refused
+    # with MALFORMED_PACKET and undecodable bytes with MALFORMED_PACKET
+    # too. The Router never crashes on either, the replies still arrive on that
+    # socket, and it keeps serving well-behaved peers.
     context = zmq.Context()
     socket = context.socket(zmq.DEALER)
     if identity is not None:
@@ -878,51 +922,73 @@ def test_garbage_bytes_from_a_dealer_with_a_non_utf8_identity_get_malformed_pack
     socket.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
     socket.connect(f"tcp://{HOST}:{network_port}")
 
-    # Registering first lets the Router route the follow-up request back to this socket, and
-    # exercises the acknowledgement sent to a non-UTF-8 identity frame.
-    registration = create_registration_packet(
-        source="non-utf8-dealer-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
-    )
-    socket.send(encode(registration))
-    _, ack_data = socket.recv_multipart()
-    _assert_registration_ack(decode(ack_data), registration)
-
     try:
+        # Bytes a pre-v2 pickle peer would send: not JSON at all, so there is no id to echo.
         socket.send(b"\x80\x04\x95pickle-bytes")
         _, error_data = socket.recv_multipart()
         reply = decode(error_data)
 
         assert reply.intent == PacketIntent.ERROR
-        # The garbage carries no readable id, so the error reply carries a null reply_to.
         assert reply.reply_to is None
         payload = ErrorPayload.model_validate(reply.payload)
         assert payload.code == ErrorCode.MALFORMED_PACKET
         assert payload.origin == ROUTER_NAME
 
-        # The Router keeps serving after garbage from the non-UTF-8 identity.
-        ping = Packet(
-            intent=PacketIntent.PING,
-            request=Request.PING,
-            source="non-utf8-dealer-client",
-            destination=PROVIDER_NAME,
+        # A valid v2 REGISTER whose source cannot match the identity frame: MALFORMED_PACKET.
+        registration = create_registration_packet(
+            source="non-utf8-dealer-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
         )
-        socket.send(encode(ping))
-        _, pong_data = socket.recv_multipart()
-        pong = decode(pong_data)
-        assert pong.request == Request.PONG
-        assert pong.reply_to == ping.id
+        socket.send(encode(registration))
+        _, error_data = socket.recv_multipart()
+        reply = decode(error_data)
+
+        assert reply.intent == PacketIntent.ERROR
+        assert reply.reply_to == registration.id
+        payload = ErrorPayload.model_validate(reply.payload)
+        assert payload.code == ErrorCode.MALFORMED_PACKET
+        assert payload.origin == ROUTER_NAME
     finally:
         # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
         # context that outlives its socket can block the interpreter at exit in zmq term().
         socket.close()
         context.term()
 
+    # The Router keeps serving well-behaved peers after the non-UTF-8 identity's Packets.
+    follow_up_context = zmq.Context()
+    follow_up = follow_up_context.socket(zmq.REQ)
+    follow_up.setsockopt(zmq.REQ_RELAXED, 1)
+    follow_up.setsockopt(zmq.REQ_CORRELATE, 1)
+    follow_up.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+    follow_up.setsockopt_string(zmq.IDENTITY, "utf8-follow-up-client")
+    follow_up.connect(f"tcp://{HOST}:{network_port}")
+    try:
+        registration = create_registration_packet(
+            source="utf8-follow-up-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
+        )
+        follow_up.send(encode(registration))
+        _assert_registration_ack(decode(follow_up.recv()), registration)
+
+        ping = Packet(
+            intent=PacketIntent.PING,
+            request=Request.PING,
+            source="utf8-follow-up-client",
+            destination=PROVIDER_NAME,
+        )
+        follow_up.send(encode(ping))
+        pong = decode(follow_up.recv())
+        assert pong.request == Request.PONG
+        assert pong.reply_to == ping.id
+    finally:
+        follow_up.close()
+        follow_up_context.term()
+
 
 def test_a_non_utf8_identity_client_receives_the_routers_own_replies(network_port: int) -> None:
-    # A REQ_CORRELATE Client whose identity frame is not UTF-8 text still receives the
-    # Router's own replies: they carry its request-id frame back, looked up by the identity
-    # bytes, not by the reply Packet's destination text. Without the frame the socket drops
-    # every reply and the Client would time out instead of getting a fast error.
+    # A REQ_CORRELATE Client whose identity frame is not UTF-8 text cannot send a Packet whose
+    # source matches it, so each of its Packets is refused with a fast
+    # MALFORMED_PACKET. Those replies still carry its request-id frame back, looked up by the
+    # identity bytes, not by the reply Packet's destination text: without the frame the socket
+    # drops every reply and the Client would time out instead of getting a fast error.
     context = zmq.Context()
     socket = context.socket(zmq.REQ)
     socket.setsockopt(zmq.REQ_RELAXED, 1)
@@ -932,30 +998,35 @@ def test_a_non_utf8_identity_client_receives_the_routers_own_replies(network_por
     socket.connect(f"tcp://{HOST}:{network_port}")
 
     try:
-        # A v2 Packet to an unknown destination gets a fast UNKNOWN_DESTINATION reply that
-        # passes the socket's request-id filter.
-        request = Packet(
-            intent=PacketIntent.DATA,
-            request=Request.GET_DEVICES,
-            source="non-utf8-req-client",
-            destination="no-such-destination",
-        )
-        socket.send(encode(request))
-        reply = decode(socket.recv())
-
-        assert reply.intent == PacketIntent.ERROR
-        assert reply.reply_to == request.id
-        payload = ErrorPayload.model_validate(reply.payload)
-        assert payload.code == ErrorCode.UNKNOWN_DESTINATION
-        assert payload.origin == ROUTER_NAME
-
-        # Its REGISTRATION_ACK passes the filter too.
+        # A v2 REGISTER whose source cannot match the identity frame: the MALFORMED_PACKET
+        # reply passes the socket's request-id filter.
         registration = create_registration_packet(
             source="non-utf8-req-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
         )
         socket.send(encode(registration))
-        ack = decode(socket.recv())
-        _assert_registration_ack(ack, registration)
+        reply = decode(socket.recv())
+
+        assert reply.intent == PacketIntent.ERROR
+        assert reply.reply_to == registration.id
+        payload = ErrorPayload.model_validate(reply.payload)
+        assert payload.code == ErrorCode.MALFORMED_PACKET
+        assert payload.origin == ROUTER_NAME
+
+        # The same for a second request on the same socket.
+        ping = Packet(
+            intent=PacketIntent.PING,
+            request=Request.PING,
+            source="non-utf8-req-client",
+            destination="no-such-destination",
+        )
+        socket.send(encode(ping))
+        reply = decode(socket.recv())
+
+        assert reply.intent == PacketIntent.ERROR
+        assert reply.reply_to == ping.id
+        payload = ErrorPayload.model_validate(reply.payload)
+        assert payload.code == ErrorCode.MALFORMED_PACKET
+        assert payload.origin == ROUTER_NAME
     finally:
         # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
         # context that outlives its socket can block the interpreter at exit in zmq term().
@@ -1089,7 +1160,7 @@ def test_wrong_version_error_packet_gets_unsupported_version(
         context.term()
 
 
-def test_wrong_version_packets_are_refused_never_handled(network_port: int) -> None:
+def test_wrong_version_packets_are_refused_never_handled(network_port: int) -> None:  # noqa: PLR0915 - one phase per refusal
     # A wrong-version Packet is refused and never handled: no second reply follows the
     # UNSUPPORTED_VERSION error, the Provider never receives the Packet, and the sender is
     # never registered. A Dealer receives every reply the Router sends it, so a second
@@ -1144,23 +1215,38 @@ def test_wrong_version_packets_are_refused_never_handled(network_port: int) -> N
         with pytest.raises(zmq.error.Again):
             socket.recv_multipart()
 
-        # The sender was never registered: a v2 Packet addressed to its name is refused with
-        # UNKNOWN_DESTINATION instead of being routed back to it.
+        # The Router delivers by identity, so a v2 Packet addressed to the sender's own name
+        # is forwarded back to it (ADR-0003), whether or not it ever registered.
         probe = Packet(
             intent=PacketIntent.PING,
             request=Request.PING,
             source="wrong-version-dealer",
             destination="wrong-version-dealer",
+            hops=41,
         )
         socket.send(encode(probe))
-        _, error_data = socket.recv_multipart()
-        reply = decode(error_data)
+        _, data = socket.recv_multipart()
+        forwarded = decode(data)
+        assert forwarded.id == probe.id
+        assert forwarded.request == Request.PING
+        assert forwarded.hops == probe.hops + 1
 
-        assert reply.intent == PacketIntent.ERROR
-        assert reply.reply_to == probe.id
-        payload = ErrorPayload.model_validate(reply.payload)
-        assert payload.code == ErrorCode.UNKNOWN_DESTINATION
-        assert payload.origin == ROUTER_NAME
+        # The sender was never registered: the v1 REGISTER was refused before it was handled,
+        # so the Directory holds the real Provider and not the sender.
+        providers = Packet(
+            intent=PacketIntent.DATA,
+            request=Request.GET_PROVIDERS,
+            source="wrong-version-dealer",
+            destination=ROUTER_NAME,
+        )
+        socket.send(encode(providers))
+        _, data = socket.recv_multipart()
+        reply = decode(data)
+        assert reply.request == Request.GET_PROVIDERS
+        assert reply.reply_to == providers.id
+        listed = [provider["name"] for provider in reply.payload["providers"]]
+        assert PROVIDER_NAME in listed
+        assert "wrong-version-dealer" not in listed
     finally:
         # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
         # context that outlives its socket can block the interpreter at exit in zmq term().
@@ -1763,6 +1849,636 @@ def test_a_large_packet_is_forwarded_intact(network_port: int) -> None:
         context.term()
 
 
+def test_spoofed_source_gets_malformed_packet(network_port: int) -> None:
+    # Every element's Identity equals its name: a Packet whose source does not match the
+    # identity frame it arrived on is refused with MALFORMED_PACKET,
+    # whatever its destination, and the Router keeps serving the honest peer on that socket.
+    context = zmq.Context()
+    socket = context.socket(zmq.DEALER)
+    socket.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+    socket.setsockopt_string(zmq.IDENTITY, "honest-client")
+    socket.connect(f"tcp://{HOST}:{network_port}")
+
+    registration = create_registration_packet(
+        source="honest-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
+    )
+    socket.send(encode(registration))
+    _, ack_data = socket.recv_multipart()
+    _assert_registration_ack(decode(ack_data), registration)
+
+    try:
+        # A spoofed source, addressed to the Router itself: refused before the Router handles
+        # the request, whatever the verb.
+        spoofed_ping = Packet(
+            intent=PacketIntent.PING, request=Request.PING, source="pretend-to-be-someone", destination=ROUTER_NAME
+        )
+        socket.send(encode(spoofed_ping))
+        _, error_data = socket.recv_multipart()
+        reply = decode(error_data)
+
+        assert reply.intent == PacketIntent.ERROR
+        assert reply.reply_to == spoofed_ping.id
+        # The reply answers the identity frame, never the spoofed source.
+        assert reply.destination == "honest-client"
+        payload = ErrorPayload.model_validate(reply.payload)
+        assert payload.code == ErrorCode.MALFORMED_PACKET
+        assert payload.origin == ROUTER_NAME
+        assert "does not match" in payload.message
+
+        # A spoofed source, addressed to a Provider: refused instead of forwarded.
+        spoofed_request = Packet(
+            intent=PacketIntent.DATA,
+            request=Request.GET_DEVICES,
+            source="pretend-to-be-someone",
+            destination=PROVIDER_NAME,
+        )
+        socket.send(encode(spoofed_request))
+        _, error_data = socket.recv_multipart()
+        reply = decode(error_data)
+
+        assert reply.intent == PacketIntent.ERROR
+        assert reply.reply_to == spoofed_request.id
+        assert reply.destination == "honest-client"
+        payload = ErrorPayload.model_validate(reply.payload)
+        assert payload.code == ErrorCode.MALFORMED_PACKET
+        assert payload.origin == ROUTER_NAME
+
+        # The Router keeps serving the honest peer on the same socket.
+        honest_ping = Packet(
+            intent=PacketIntent.PING, request=Request.PING, source="honest-client", destination=PROVIDER_NAME
+        )
+        socket.send(encode(honest_ping))
+        _, pong_data = socket.recv_multipart()
+        pong = decode(pong_data)
+        assert pong.request == Request.PONG
+        assert pong.reply_to == honest_ping.id
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        socket.close()
+        context.term()
+
+
+def test_ping_to_the_router_gets_pong(raw_client: _RawClient) -> None:
+    # A PING addressed to the Router itself is answered by the Router with a PONG,
+    # echoing the request's id as reply_to.
+    request = Packet(intent=PacketIntent.PING, request=Request.PING, source=raw_client.name, destination=ROUTER_NAME)
+
+    reply = raw_client.ask(request)
+
+    assert reply.intent == PacketIntent.PING
+    assert reply.request == Request.PONG
+    assert reply.source == ROUTER_NAME
+    assert reply.destination == raw_client.name
+    assert reply.reply_to == request.id
+    assert reply.payload is None
+
+
+def test_get_providers_lists_devices_and_a_sensible_last_seen(network_port: int) -> None:
+    # Other tests in this module register their own Providers on the same Router, and
+    # Directory entries are never removed, so this test checks the Providers it knows about.
+    client = _client(network_port)
+    # A registered Client: the Directory holds a single record per registered Provider, so a
+    # Client's REGISTER is ACKed but never enters the Directory.
+    listed_client = _RawClient(network_port, "never-listed-client")
+    try:
+        first = client.get_providers()
+
+        assert PROVIDER_NAME in first
+        assert "never-listed-client" not in first
+        provider = first[PROVIDER_NAME]
+        # The devices the Provider reported at registration are listed.
+        assert provider.devices == client.get_available_devices(PROVIDER_NAME)
+
+        # Last seen is the time of the most recent Heartbeat: recent, and in UTC.
+        last_seen = provider.last_seen
+        assert last_seen.tzinfo is not None
+        now = datetime.datetime.now(datetime.UTC)
+        recent_window_s = 30
+        assert datetime.timedelta(0) <= now - last_seen < datetime.timedelta(seconds=recent_window_s)
+
+        # A Heartbeat refreshes Last seen: a later reading is newer.
+        time.sleep(2)
+        second = client.get_providers()
+        assert second[PROVIDER_NAME].last_seen > last_seen
+        assert "never-listed-client" not in second
+    finally:
+        # Close the socket while the Client is alive: a Client that only dies by garbage
+        # collection can block another thread's garbage collection in zmq Context.term().
+        client.disconnect()
+        listed_client.close()
+
+
+def test_killing_a_provider_then_sending_gets_destination_unreachable_quickly() -> None:
+    # A Provider that has gone away is still in the Directory (entries are never removed), so
+    # the Router replies DESTINATION_UNREACHABLE with its Last seen, and quickly: the send
+    # fails fast under ROUTER_MANDATORY instead of queuing the Packet for a dead peer.
+    port = _free_port()
+    router = Router(ROUTER_NAME, HOST, port)
+    threading.Thread(target=router.start, daemon=True).start()
+    _wait_until(lambda: router.running, 10, "Router did not start.")
+
+    provider = InstrumentProvider(
+        PROVIDER_NAME,
+        HOST,
+        port,
+        ROUTER_NAME,
+        dummy1={
+            "import": "pqn_hardware.drivers.dummies.DummyInstrument",
+            "desc": "Dummy instrument for the unreachable test",
+            "hw_address": "1234",
+        },
+    )
+    threading.Thread(target=provider.start, daemon=True).start()
+    _wait_until(lambda: PROVIDER_NAME in router.directory, 15, "InstrumentProvider did not register with the Router.")
+
+    client = Client(host=HOST, port=port, router_name=ROUTER_NAME, timeout=10_000)
+    try:
+        assert client.ping(PROVIDER_NAME).request == Request.PONG
+
+        # Kill the Provider: its loop stops and its socket closes.
+        provider.running = False
+        _wait_until(lambda: provider.socket is not None and provider.socket.closed, 10, "Provider did not stop.")
+        # Let the Router's connection table drop the closed peer.
+        time.sleep(0.5)
+
+        start = time.monotonic()
+        with pytest.raises(PacketError) as exc_info:
+            client.ping(PROVIDER_NAME)
+        elapsed_s = time.monotonic() - start
+
+        error = exc_info.value
+        assert error.code == ErrorCode.DESTINATION_UNREACHABLE
+        assert error.origin == ROUTER_NAME
+        # The dead Provider is still in the Directory, so the details carry its Last seen.
+        last_seen = datetime.datetime.fromisoformat(error.details["last_seen"])
+        assert last_seen.tzinfo is not None
+        assert datetime.datetime.now(datetime.UTC) - last_seen < datetime.timedelta(seconds=30)
+        # The reply is fast: well under the Client's timeout.
+        quick_reply_bound_s = 2.0
+        assert elapsed_s < quick_reply_bound_s
+
+        # The dead Provider stays listed in the Directory with its old Last seen.
+        providers = client.get_providers()
+        assert PROVIDER_NAME in providers
+        assert providers[PROVIDER_NAME].last_seen == last_seen
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        client.disconnect()
+        provider.running = False
+        _stop_router(router)
+
+
+def test_an_undeliverable_packet_gets_exactly_one_error_reply() -> None:
+    # A Packet to a destination that cannot be reached gets exactly one error reply: the
+    # Router never answers the same Packet twice. A REQ Client keeps only the first reply,
+    # so a second, contradictory one would go unnoticed by it; a DEALER peer (e.g. a
+    # Provider replying to a peer that went away) receives every reply the Router sends, so
+    # the count is asserted from one. A registered Provider that has gone away gets
+    # DESTINATION_UNREACHABLE; a name that was never registered gets UNKNOWN_DESTINATION.
+    port = _free_port()
+    router = Router(ROUTER_NAME, HOST, port)
+    threading.Thread(target=router.start, daemon=True).start()
+    _wait_until(lambda: router.running, 10, "Router did not start.")
+
+    context = zmq.Context()
+    # A Provider that registers and then goes away: it stays in the Directory (entries are
+    # never removed), so Packets to it are undeliverable, not unknown.
+    gone = context.socket(zmq.DEALER)
+    gone.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+    gone.setsockopt_string(zmq.IDENTITY, "gone-provider")
+    gone.connect(f"tcp://{HOST}:{port}")
+    gone_registration = create_registration_packet(
+        source="gone-provider", destination=ROUTER_NAME, kind=NetworkElementClass.PROVIDER
+    )
+    gone.send(encode(gone_registration))
+    _, gone_ack = gone.recv_multipart()
+    _assert_registration_ack(decode(gone_ack), gone_registration)
+    gone.close(linger=0)
+    # Let the Router's connection table drop the closed peer, as the killing test does.
+    time.sleep(0.5)
+
+    # The sender: a Provider-like DEALER, so it receives every reply the Router sends it.
+    sender = context.socket(zmq.DEALER)
+    sender.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+    sender.setsockopt_string(zmq.IDENTITY, "reply-counting-provider")
+    sender.connect(f"tcp://{HOST}:{port}")
+    sender_registration = create_registration_packet(
+        source="reply-counting-provider", destination=ROUTER_NAME, kind=NetworkElementClass.PROVIDER
+    )
+    sender.send(encode(sender_registration))
+    _, sender_ack = sender.recv_multipart()
+    _assert_registration_ack(decode(sender_ack), sender_registration)
+
+    poller = zmq.Poller()
+    poller.register(sender, zmq.POLLIN)
+    try:
+        for destination, expected_code in (
+            ("gone-provider", ErrorCode.DESTINATION_UNREACHABLE),
+            ("never-registered", ErrorCode.UNKNOWN_DESTINATION),
+        ):
+            packet = Packet(
+                intent=PacketIntent.DATA,
+                request=Request.GET_DEVICE_STRUCTURE,
+                source="reply-counting-provider",
+                destination=destination,
+            )
+            sender.send(encode(packet))
+            replies = dict(poller.poll(ERROR_TIMEOUT_MS))
+            assert sender in replies, f"no error reply arrived for '{destination}'"
+            _, reply_data = sender.recv_multipart()
+            _assert_error_reply(decode(reply_data), packet, expected_code, ROUTER_NAME)
+
+            # Exactly one reply: nothing else arrives for the same Packet within the window.
+            extra = dict(poller.poll(500))
+            assert sender not in extra, f"a second reply arrived for '{destination}'"
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        sender.close(linger=0)
+        context.term()
+        _stop_router(router)
+
+
+def test_restarting_the_router_lets_the_client_and_provider_talk_again() -> None:
+    # After a Router restart the Client never re-registers: delivery is by identity, so the
+    # same Client and Provider talk again on the restarted Router without being re-created
+    # (ADR-0003). The Provider's Heartbeats re-register it and refresh the new Directory.
+    port = _free_port()
+    router = Router(ROUTER_NAME, HOST, port)
+    threading.Thread(target=router.start, daemon=True).start()
+    _wait_until(lambda: router.running, 10, "Router did not start.")
+
+    provider = InstrumentProvider(
+        PROVIDER_NAME,
+        HOST,
+        port,
+        ROUTER_NAME,
+        dummy1={
+            "import": "pqn_hardware.drivers.dummies.DummyInstrument",
+            "desc": "Dummy instrument for the restart test",
+            "hw_address": "1234",
+        },
+    )
+    threading.Thread(target=provider.start, daemon=True).start()
+    _wait_until(lambda: PROVIDER_NAME in router.directory, 15, "InstrumentProvider did not register with the Router.")
+
+    client = Client(host=HOST, port=port, router_name=ROUTER_NAME, timeout=10_000)
+    try:
+        assert client.ping(PROVIDER_NAME).request == Request.PONG
+
+        # Restart the Router: stop it, let its port go, and start a new one in its place.
+        _stop_router(router)
+        time.sleep(0.5)
+        restarted = Router(ROUTER_NAME, HOST, port)
+        threading.Thread(target=restarted.start, daemon=True).start()
+        _wait_until(lambda: restarted.running, 10, "Restarted Router did not start.")
+        # The Provider's Heartbeat re-registers it with the restarted Router.
+        _wait_until(
+            lambda: PROVIDER_NAME in restarted.directory, 15, "InstrumentProvider did not re-register after restart."
+        )
+
+        # The same Client, never re-created and never re-registered, talks to the Provider again.
+        pong = client.ping(PROVIDER_NAME)
+        assert pong.request == Request.PONG
+        assert pong.source == PROVIDER_NAME
+        devices = client.get_available_devices(PROVIDER_NAME)
+        assert set(devices) == {"dummy1"}
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        client.disconnect()
+        provider.running = False
+        _stop_router(restarted)
+
+
+def _flood_until_unreachable(sender: zmq.Socket[bytes], flood_packet: Packet) -> Packet | None:
+    """Flood Packets to the stuck Provider until the Router's send queue is full.
+
+    Returns the reply to the flood, or None when the queue never filled within the bound.
+    """
+    flood_batch = 500
+    flood_batches = 8
+    for _ in range(flood_batches):
+        for _ in range(flood_batch):
+            sender.send(encode(flood_packet))
+        try:
+            return decode(sender.recv())
+        except zmq.error.Again:
+            # The flood Packet was still queued for the stuck Provider: keep flooding.
+            continue
+    return None
+
+
+def test_a_peer_at_its_high_water_mark_gets_destination_unreachable_and_the_router_keeps_serving() -> None:
+    # A connected Provider that stops reading (stuck in a long Operation, or gone half-open
+    # before the transport heartbeat closes it) fills the Router's send queue. The Router's
+    # sends never block (zmq.DONTWAIT in _send), so a Packet to the stuck Provider raises
+    # instead of freezing the Router: the sender gets DESTINATION_UNREACHABLE with the
+    # Provider's Last seen, and the Router keeps serving right after.
+    # The transport heartbeats are off: tearing a Router down while a heartbeat engine talks
+    # to a full, unread peer trips a libzmq assertion (stream_engine_base.cpp), and the
+    # heartbeat path is not what this test exercises.
+    port = _free_port()
+    router = Router(ROUTER_NAME, HOST, port, heartbeat_ivl=0)
+    threading.Thread(target=router.start, daemon=True).start()
+    _wait_until(lambda: router.running, 10, "Router did not start.")
+
+    context = zmq.Context()
+    # The stuck Provider stand-in: a receive high-water mark of one message, and no reads
+    # after its registration, so the Router's sends to it cannot be queued for long.
+    stuck = context.socket(zmq.DEALER)
+    stuck.setsockopt(zmq.RCVHWM, 1)
+    stuck.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+    stuck.setsockopt_string(zmq.IDENTITY, "stuck-provider")
+    stuck.connect(f"tcp://{HOST}:{port}")
+    stuck_registration = create_registration_packet(
+        source="stuck-provider", destination=ROUTER_NAME, kind=NetworkElementClass.PROVIDER
+    )
+    stuck.send(encode(stuck_registration))
+    _, ack_data = stuck.recv_multipart()
+    _assert_registration_ack(decode(ack_data), stuck_registration)
+
+    # The sender floods Packets addressed to the stuck Provider until its send queue is full.
+    # The Packets are large, so the TCP window cannot absorb them and the queue fills after
+    # about a thousand sends, well inside the flood bound below.
+    sender = context.socket(zmq.REQ)
+    sender.setsockopt(zmq.REQ_RELAXED, 1)
+    sender.setsockopt(zmq.REQ_CORRELATE, 1)
+    poll_timeout_ms = 100
+    sender.setsockopt(zmq.RCVTIMEO, poll_timeout_ms)
+    sender.setsockopt_string(zmq.IDENTITY, "hwm-client")
+    sender.connect(f"tcp://{HOST}:{port}")
+    sender_registration = create_registration_packet(
+        source="hwm-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
+    )
+    sender.send(encode(sender_registration))
+    _assert_registration_ack(decode(sender.recv()), sender_registration)
+
+    flood_packet = Packet(
+        intent=PacketIntent.DATA,
+        request=Request.GET_DEVICE_STRUCTURE,
+        source="hwm-client",
+        destination="stuck-provider",
+        payload={"padding": "x" * 10_000},
+    )
+    try:
+        reply = _flood_until_unreachable(sender, flood_packet)
+        assert reply is not None, "the stuck Provider's send queue never filled; EAGAIN was never raised"
+        error = _assert_error_reply(reply, flood_packet, ErrorCode.DESTINATION_UNREACHABLE, ROUTER_NAME)
+        # The stuck Provider is in the Directory, so the details carry its Last seen.
+        assert "last_seen" in error.details
+
+        # The Router still serves right after the stuck Provider filled its queue.
+        router_ping = Packet(
+            intent=PacketIntent.PING, request=Request.PING, source="hwm-client", destination=ROUTER_NAME
+        )
+        sender.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+        sender.send(encode(router_ping))
+        pong = decode(sender.recv())
+        assert pong.request == Request.PONG
+        assert pong.source == ROUTER_NAME
+        assert pong.reply_to == router_ping.id
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        sender.close()
+        stuck.close()
+        context.term()
+        _stop_router(router)
+
+
+def test_router_heartbeat_options_are_configurable() -> None:
+    # The ZMQ transport heartbeats are configurable: a Router started with
+    # other values carries them on its socket, and a Router started without them uses the defaults.
+    configured_ivl_ms = 250
+    configured_timeout_ms = 750
+    port = _free_port()
+    router = Router(ROUTER_NAME, HOST, port, heartbeat_ivl=configured_ivl_ms, heartbeat_timeout=configured_timeout_ms)
+    threading.Thread(target=router.start, daemon=True).start()
+    try:
+        _wait_until(lambda: router.running, 10, "Router did not start.")
+        assert router.socket is not None
+        assert router.socket.getsockopt(zmq.HEARTBEAT_IVL) == configured_ivl_ms
+        assert router.socket.getsockopt(zmq.HEARTBEAT_TIMEOUT) == configured_timeout_ms
+    finally:
+        _stop_router(router)
+
+    # The defaults are 1000 ms and 5000 ms.
+    default_ivl_ms = 1000
+    default_timeout_ms = 5000
+    default_router = Router(ROUTER_NAME, HOST, port)
+    assert default_router.heartbeat_ivl == ZMQ_HEARTBEAT_IVL == default_ivl_ms
+    assert default_router.heartbeat_timeout == ZMQ_HEARTBEAT_TIMEOUT == default_timeout_ms
+
+
+def test_router_config_reads_the_heartbeat_keys(tmp_path: Path) -> None:
+    config = tmp_path / "router.toml"
+    config.write_text(
+        "[router]\n"
+        'name = "configured-router"\n'
+        'host = "127.0.0.1"\n'
+        "port = 5555\n"
+        "heartbeat_ivl = 250\n"
+        "heartbeat_timeout = 750\n"
+    )
+
+    kwargs = _load_and_parse_router_config(config, {})
+
+    assert kwargs == {
+        "name": "configured-router",
+        "host": "127.0.0.1",
+        "port": 5555,
+        "heartbeat_ivl": 250,
+        "heartbeat_timeout": 750,
+    }
+
+
+def test_start_router_options_reach_the_router(monkeypatch: pytest.MonkeyPatch) -> None:
+    started: list[dict[str, str | int]] = []
+
+    class _FakeRouter:
+        def __init__(self, **kwargs: str | int) -> None:
+            started.append(kwargs)
+
+        def start(self) -> None:
+            return None
+
+    monkeypatch.setattr("pqn_hardware.cli.Router", _FakeRouter)
+
+    start_router(name="cli-router", heartbeat_ivl=250, heartbeat_timeout=750)
+
+    assert started == [{"name": "cli-router", "heartbeat_ivl": 250, "heartbeat_timeout": 750}]
+
+
+def _flood_until_dropped(flood: zmq.Socket[bytes], flood_packet: Packet, dropped: Callable[[], bool]) -> None:
+    """Flood requests the Router replies to until it drops one of the replies with a warning.
+
+    The flood is bounded: the Router's send queue to a peer that never reads fills well within
+    the bound, and a Router that never drops a reply fails the test instead of hanging it.
+    """
+    flood_batch = 500
+    flood_batches = 20
+    for _ in range(flood_batches):
+        for _ in range(flood_batch):
+            flood.send(encode(flood_packet))
+        if dropped():
+            return
+    msg = "the flood peer's pipe never filled; the Router's replies were never dropped"
+    raise AssertionError(msg)
+
+
+def test_a_peer_that_stops_reading_cannot_crash_the_router(caplog: pytest.LogCaptureFixture) -> None:
+    # A peer that stops reading fills the Router's send queue with replies to it. The
+    # Router's own replies, and separately its error replies, are then dropped with a
+    # warning instead of blocking or crashing the Router: the Router never freezes on one
+    # peer, and a second peer's PING still gets its PONG.
+    # The transport heartbeats are off: tearing a Router down while a heartbeat engine talks
+    # to a full, unread peer trips a libzmq assertion (stream_engine_base.cpp), and the
+    # heartbeat path is not what this test exercises.
+    port = _free_port()
+    router = Router(ROUTER_NAME, HOST, port, heartbeat_ivl=0)
+    router_thread = threading.Thread(target=router.start, daemon=True)
+    router_thread.start()
+    _wait_until(lambda: router.running, 10, "Router did not start.")
+
+    context = zmq.Context()
+    # A stand-in Provider with a large device description: the Directory, and so every
+    # GET_PROVIDERS reply to the flood peer, is large, so the peer's pipe fills within the
+    # flood bound below.
+    stand_in = context.socket(zmq.DEALER)
+    stand_in.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+    stand_in.setsockopt_string(zmq.IDENTITY, "big-directory-provider")
+    stand_in.connect(f"tcp://{HOST}:{port}")
+    stand_in_registration = create_registration_packet(
+        source="big-directory-provider",
+        destination=ROUTER_NAME,
+        kind=NetworkElementClass.PROVIDER,
+        devices={"device-big": DeviceSummary(type="property.Driver", desc="x" * 10_000, hw_address="1")},
+    )
+    stand_in.send(encode(stand_in_registration))
+    _, ack_data = stand_in.recv_multipart()
+    _assert_registration_ack(decode(ack_data), stand_in_registration)
+
+    # The flood peer: a receive high-water mark of one message and no reads at all, so the
+    # Router's replies to it cannot be queued for long. Its own send high-water mark holds
+    # the whole flood, so the flood never blocks even if the Router stops reading it.
+    flood = context.socket(zmq.DEALER)
+    flood.setsockopt(zmq.RCVHWM, 1)
+    flood.setsockopt(zmq.SNDHWM, 20_000)
+    flood.setsockopt_string(zmq.IDENTITY, "non-reading-client")
+    flood.connect(f"tcp://{HOST}:{port}")
+
+    # A second peer that reads, to prove the Router keeps serving throughout.
+    reader = context.socket(zmq.REQ)
+    reader.setsockopt(zmq.REQ_RELAXED, 1)
+    reader.setsockopt(zmq.REQ_CORRELATE, 1)
+    reader.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+    reader.setsockopt_string(zmq.IDENTITY, "reading-client")
+    reader.connect(f"tcp://{HOST}:{port}")
+    reader_registration = create_registration_packet(
+        source="reading-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
+    )
+    reader.send(encode(reader_registration))
+    _assert_registration_ack(decode(reader.recv()), reader_registration)
+
+    get_providers = Packet(
+        intent=PacketIntent.DATA, request=Request.GET_PROVIDERS, source="non-reading-client", destination=ROUTER_NAME
+    )
+    try:
+        with caplog.at_level(logging.WARNING, logger="pqn_hardware.network.router"):
+            # The Router's own replies to the flood peer are dropped with a warning: the
+            # GET_PROVIDERS replies it cannot queue anymore.
+            _flood_until_dropped(
+                flood,
+                get_providers,
+                lambda: any("Could not send a reply" in record.message for record in caplog.records),
+            )
+
+            # The Router's error replies to the flood peer are dropped too, with their own
+            # warning: bytes the Router answers with a MALFORMED_PACKET error reply. The
+            # bytes queue behind the flood's leftover requests, so the wait is generous:
+            # under load the Router chews through the backlog for seconds before it reaches
+            # them.
+            for _ in range(5):
+                flood.send(b"\x80\x04 not valid JSON")
+            _wait_until(
+                lambda: any("Could not send the error reply" in record.message for record in caplog.records),
+                10,
+                "the Router never dropped an error reply to the full peer",
+            )
+
+        # The Router kept serving throughout: the reading peer's PING still gets its PONG.
+        ping = Packet(intent=PacketIntent.PING, request=Request.PING, source="reading-client", destination=ROUTER_NAME)
+        reader.send(encode(ping))
+        pong = decode(reader.recv())
+        assert pong.request == Request.PONG
+        assert pong.source == ROUTER_NAME
+        assert pong.reply_to == ping.id
+        # The Router's own thread survived every dropped reply: nothing the unread peer did
+        # could crash the Router.
+        assert router_thread.is_alive()
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        # The sockets close with no linger: a flood peer can still hold undelivered messages,
+        # and waiting for them to transfer would hang the teardown.
+        reader.close(linger=0)
+        flood.close(linger=0)
+        stand_in.close(linger=0)
+        context.term()
+        _stop_router(router)
+
+
+def test_get_providers_lists_every_registered_provider() -> None:
+    # The Directory holds a single record per registered Provider, so GET_PROVIDERS lists
+    # every registered Provider, each with the devices it reported at registration.
+    port = _free_port()
+    router = Router(ROUTER_NAME, HOST, port)
+    threading.Thread(target=router.start, daemon=True).start()
+    _wait_until(lambda: router.running, 10, "Router did not start.")
+
+    context = zmq.Context()
+    devices_by_provider = {
+        "first-provider": {
+            "device-a": DeviceSummary(type="pqn.First", desc="the first provider's device", hw_address="1")
+        },
+        "second-provider": {
+            "device-b": DeviceSummary(type="pqn.Second", desc="the second provider's device", hw_address="2")
+        },
+    }
+    stand_ins = []
+    for name, devices in devices_by_provider.items():
+        stand_in = context.socket(zmq.DEALER)
+        stand_in.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+        stand_in.setsockopt_string(zmq.IDENTITY, name)
+        stand_in.connect(f"tcp://{HOST}:{port}")
+        registration = create_registration_packet(
+            source=name, destination=ROUTER_NAME, kind=NetworkElementClass.PROVIDER, devices=devices
+        )
+        stand_in.send(encode(registration))
+        _, ack_data = stand_in.recv_multipart()
+        _assert_registration_ack(decode(ack_data), registration)
+        stand_ins.append(stand_in)
+
+    client = Client(host=HOST, port=port, router_name=ROUTER_NAME, timeout=10_000)
+    try:
+        providers = client.get_providers()
+
+        assert set(providers) == set(devices_by_provider)
+        for name, devices in devices_by_provider.items():
+            assert providers[name].devices == devices
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        client.disconnect()
+        for stand_in in stand_ins:
+            stand_in.close()
+        context.term()
+        _stop_router(router)
+
+
 @pytest.mark.parametrize("hops", [0, 1], ids=["hops-0", "hops-1"])
 def test_error_packet_addressed_to_the_router_is_never_answered(
     network_port: int, caplog: pytest.LogCaptureFixture, hops: int
@@ -1820,20 +2536,21 @@ def test_error_packet_addressed_to_the_router_is_never_answered(
 @pytest.mark.parametrize(
     ("intent", "verb"),
     [
-        (PacketIntent.DATA, Request.GET_PROVIDERS),
+        (PacketIntent.DATA, Request.GET_DEVICES),
         (PacketIntent.CONTROL, Request.GET_PARAMETER),
     ],
     ids=["data-packet", "control-packet"],
 )
-def test_data_packet_addressed_to_the_router_is_dropped_not_answered(
+def test_unsupported_request_addressed_to_the_router_gets_unsupported_request(
     network_port: int, intent: PacketIntent, verb: Request
 ) -> None:
-    # A DATA or CONTROL Packet addressed to the Router is dropped with a log line. Whatever the
-    # Intent, the Router never answers a Packet addressed to itself with an error naming
-    # itself as the destination: the sender gets no reply at all.
+    # Anything addressed to the Router that is not REGISTER, PING or GET_PROVIDERS is refused
+    # with a fast UNSUPPORTED_REQUEST instead of being dropped silently:
+    # the Router never leaves the sender waiting for a reply that never comes.
     context = zmq.Context()
     socket = context.socket(zmq.REQ)
     socket.setsockopt(zmq.REQ_RELAXED, 1)
+    socket.setsockopt(zmq.REQ_CORRELATE, 1)
     socket.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
     socket.setsockopt_string(zmq.IDENTITY, "data-to-router-client")
     socket.connect(f"tcp://{HOST}:{network_port}")
@@ -1853,12 +2570,89 @@ def test_data_packet_addressed_to_the_router_is_dropped_not_answered(
             destination=ROUTER_NAME,
         )
         socket.send(encode(request))
-        with pytest.raises(zmq.error.Again):
-            socket.recv()
+        reply = decode(socket.recv())
 
-        # The Router keeps serving after dropping the DATA Packet.
+        payload = _assert_error_reply(reply, request, ErrorCode.UNSUPPORTED_REQUEST, ROUTER_NAME)
+        assert "does not handle request" in payload.message
+
+        # The Router keeps serving after refusing the request.
         ping = Packet(
             intent=PacketIntent.PING, request=Request.PING, source="data-to-router-client", destination=PROVIDER_NAME
+        )
+        socket.send(encode(ping))
+        pong = decode(socket.recv())
+        assert pong.request == Request.PONG
+        assert pong.reply_to == ping.id
+    finally:
+        # Close the sockets even when an assert fails: a stored failure keeps the frames, and a
+        # context that outlives its socket can block the interpreter at exit in zmq term().
+        socket.close()
+        context.term()
+
+
+def test_undeliverable_error_packet_is_dropped_with_a_warning(
+    network_port: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    # An ERROR Packet the Router cannot deliver is dropped, never answered: answering it
+    # would only reach a sender that logs the answer and sends nothing. The Router
+    # logs a warning naming the destination and the error code the Packet carried.
+    # The dead destination: a Provider stand-in that registered and then went away, so it is
+    # still in the Directory but no longer connected.
+    stand_in_context = zmq.Context()
+    stand_in = stand_in_context.socket(zmq.DEALER)
+    stand_in.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+    stand_in.setsockopt_string(zmq.IDENTITY, "short-lived-provider")
+    stand_in.connect(f"tcp://{HOST}:{network_port}")
+    stand_in_registration = create_registration_packet(
+        source="short-lived-provider", destination=ROUTER_NAME, kind=NetworkElementClass.PROVIDER
+    )
+    stand_in.send(encode(stand_in_registration))
+    _, ack_data = stand_in.recv_multipart()
+    _assert_registration_ack(decode(ack_data), stand_in_registration)
+    stand_in.close()
+    stand_in_context.term()
+    # Let the Router's connection table drop the closed peer.
+    time.sleep(0.5)
+
+    context = zmq.Context()
+    socket = context.socket(zmq.REQ)
+    socket.setsockopt(zmq.REQ_RELAXED, 1)
+    socket.setsockopt(zmq.RCVTIMEO, ERROR_TIMEOUT_MS)
+    socket.setsockopt_string(zmq.IDENTITY, "error-sender-client")
+    socket.connect(f"tcp://{HOST}:{network_port}")
+
+    registration = create_registration_packet(
+        source="error-sender-client", destination=ROUTER_NAME, kind=NetworkElementClass.CLIENT
+    )
+    socket.send(encode(registration))
+    registration_ack = decode(socket.recv())
+    _assert_registration_ack(registration_ack, registration)
+
+    try:
+        for destination in ("no-such-provider", "short-lived-provider"):
+            error_packet = Packet(
+                intent=PacketIntent.ERROR,
+                request=Request.ERROR,
+                source="error-sender-client",
+                destination=destination,
+                payload=ErrorPayload(
+                    code=ErrorCode.INSTRUMENT_ERROR, message="a reply to a sender that is gone", origin="error-sender"
+                ).model_dump(),
+            )
+            with caplog.at_level(logging.WARNING, logger="pqn_hardware.network.router"):
+                socket.send(encode(error_packet))
+                # The sender gets no reply at all, not even an error about the error.
+                with pytest.raises(zmq.error.Again):
+                    socket.recv()
+
+            assert any(
+                f"Cannot deliver the ERROR Packet (code INSTRUMENT_ERROR) to '{destination}'" in record.message
+                for record in caplog.records
+            )
+
+        # The Router keeps serving after dropping the undeliverable ERROR Packets.
+        ping = Packet(
+            intent=PacketIntent.PING, request=Request.PING, source="error-sender-client", destination=PROVIDER_NAME
         )
         socket.send(encode(ping))
         pong = decode(socket.recv())

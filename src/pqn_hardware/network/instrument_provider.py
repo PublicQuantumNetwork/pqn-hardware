@@ -468,7 +468,10 @@ class InstrumentProvider:
 
             self.socket.connect(self.address)
             reg_packet = create_registration_packet(
-                source=self.name, destination=self.router_name, kind=NetworkElementClass.PROVIDER
+                source=self.name,
+                destination=self.router_name,
+                kind=NetworkElementClass.PROVIDER,
+                devices=self._device_summaries(),
             )
             self.socket.send(encode(reg_packet))
             logger.info("Sent registration packet to router at %s", self.address)
@@ -493,8 +496,9 @@ class InstrumentProvider:
             payload=None,
         )
 
-    def _handle_get_devices(self, packet: Packet) -> Packet:
-        devices = {
+    def _device_summaries(self) -> dict[str, DeviceSummary]:
+        """Summarize every Instrument the Provider owns, for REGISTER and GET_DEVICES replies."""
+        return {
             name: DeviceSummary(
                 type=f"{type(ins).__module__}.{type(ins).__qualname__}",
                 desc=ins.desc,
@@ -502,13 +506,15 @@ class InstrumentProvider:
             )
             for name, ins in self.instantiated_instruments.items()
         }
+
+    def _handle_get_devices(self, packet: Packet) -> Packet:
         return Packet(
             intent=PacketIntent.DATA,
             request=Request.GET_DEVICES,
             source=self.name,
             destination=packet.source,
             reply_to=packet.id,
-            payload=DevicesPayload(devices=devices).model_dump(),
+            payload=DevicesPayload(devices=self._device_summaries()).model_dump(),
         )
 
     def _handle_get_device_structure(self, packet: Packet) -> Packet:

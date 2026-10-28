@@ -2,6 +2,8 @@
 name = "pqn_hardware-router"
 host = "localhost"
 port = 5556
+heartbeat_ivl = 1000
+heartbeat_timeout = 5000
 
 [provider]
 name = "pqn_hardware-provider"

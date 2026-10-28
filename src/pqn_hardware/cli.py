@@ -140,11 +140,15 @@ def _load_and_parse_router_config(config_path: Path | str, kwargs: dict[str, str
         kwargs["host"] = str(router["host"])
     if "port" in router:
         kwargs["port"] = int(router["port"])
+    if "heartbeat_ivl" in router:
+        kwargs["heartbeat_ivl"] = int(router["heartbeat_ivl"])
+    if "heartbeat_timeout" in router:
+        kwargs["heartbeat_timeout"] = int(router["heartbeat_timeout"])
     return kwargs
 
 
 @app.command()
-def start_router(
+def start_router(  # noqa: PLR0913
     name: Annotated[str | None, typer.Option(help="Name of the router (default 'router1')")] = None,
     host: Annotated[
         str | None,
@@ -153,6 +157,12 @@ def start_router(
         ),
     ] = None,
     port: Annotated[str | None, typer.Option(help="Port of the router (default: 5555)")] = None,
+    heartbeat_ivl: Annotated[
+        int | None, typer.Option(help="ZMQ transport heartbeat interval in milliseconds (default: 1000)")
+    ] = None,
+    heartbeat_timeout: Annotated[
+        int | None, typer.Option(help="ZMQ transport heartbeat timeout in milliseconds (default: 5000)")
+    ] = None,
     config: Annotated[
         str | None, typer.Option(help="Path to the config file, will get overridden by command line arguments.")
     ] = None,
@@ -172,6 +182,10 @@ def start_router(
         kwargs["host"] = host
     if port:
         kwargs["port"] = int(port)
+    if heartbeat_ivl:
+        kwargs["heartbeat_ivl"] = heartbeat_ivl
+    if heartbeat_timeout:
+        kwargs["heartbeat_timeout"] = heartbeat_timeout
 
     if "name" not in kwargs:
         msg = "Router name is required"
