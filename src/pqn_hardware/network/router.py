@@ -1,12 +1,16 @@
-import copy
 import logging
-import pickle
 
 import zmq
 
+from pqn_hardware.network.packet import ErrorCode
+from pqn_hardware.network.packet import ErrorPayload
 from pqn_hardware.network.packet import NetworkElementClass
 from pqn_hardware.network.packet import Packet
 from pqn_hardware.network.packet import PacketIntent
+from pqn_hardware.network.packet import RegisterPayload
+from pqn_hardware.network.packet import Request
+from pqn_hardware.network.packet import decode
+from pqn_hardware.network.packet import encode
 
 logger = logging.getLogger(__name__)
 
@@ -52,8 +56,6 @@ class Router:
                 match packet.intent:
                     case PacketIntent.REGISTRATION:
                         self.handle_registration(identity_binary, packet)
-                    case PacketIntent.ROUTING:
-                        logger.info("Got routing packet from %s", identity_binary)
                     case _:
                         self.handle_pass_packet(identity_binary, packet)
 
@@ -62,26 +64,24 @@ class Router:
 
     def handle_registration(self, identity_binary: bytes, packet: Packet) -> None:
         if packet.destination != self.name:
-            self.handle_packet_error(identity_binary, f"Router {self.name} is not the destination")
+            self.handle_packet_error(
+                identity_binary, ErrorCode.MALFORMED_PACKET, f"Router {self.name} is not the destination"
+            )
             return
-        match packet.payload:
+        payload = RegisterPayload.model_validate(packet.payload)
+        match payload.kind:
             case NetworkElementClass.PROVIDER:
                 self.providers[packet.source] = identity_binary
                 logger.info("InstrumentProvider %s registered", identity_binary)
             case NetworkElementClass.CLIENT:
                 self.clients[packet.source] = identity_binary
                 logger.info("Client %s registered", identity_binary)
-            case NetworkElementClass.ROUTER:
-                self.routers[packet.source] = identity_binary
-                logger.info("Router %s registered", identity_binary)
 
         ack_packet = Packet(
             intent=PacketIntent.REGISTRATION_ACK,
+            request=Request.ACKNOWLEDGE,
             source=self.name,
             destination=identity_binary.decode("utf-8"),
-            hops=0,
-            request="ACKNOWLEDGE",
-            payload=None,
         )
         self._send(identity_binary, ack_packet)
 
@@ -92,11 +92,12 @@ class Router:
 
         elif packet.destination in self.providers or packet.destination in self.clients:
             logger.info("Packet destination is a provider called %s, routing message there", packet.destination)
-            forward_packet = copy.copy(packet)
-            forward_packet.hops += 1
+            forward_packet = packet.model_copy(update={"hops": packet.hops + 1})
             dest = self.providers.get(packet.destination) or self.clients.get(packet.destination)
             if dest is None:
-                self.handle_packet_error(identity_binary, f"Destination {packet.destination} not found.")
+                self.handle_packet_error(
+                    identity_binary, ErrorCode.UNKNOWN_DESTINATION, f"Destination {packet.destination} not found."
+                )
                 return
             self._send(dest, forward_packet)
             logger.info("Sent packet to %s", packet.destination)
@@ -104,7 +105,7 @@ class Router:
         else:
             logger.info("Packet destination is not a provider will ask other routers in system")
             # FIXME: This is temporary and should be replaced with the routing algorithm.
-            self.handle_packet_error(identity_binary, "Routing not implemented yet.")
+            self.handle_packet_error(identity_binary, ErrorCode.UNKNOWN_DESTINATION, "Routing not implemented yet.")
 
     def listen(self) -> tuple[bytes, Packet] | tuple[None, None]:
         # This should never happen, but mypy complains if the check is not done
@@ -119,14 +120,16 @@ class Router:
         req_parts = 3
         request = self.socket.recv_multipart()
         if len(request) == dealer_parts:
-            identity_binary, pickled_packet = request
+            identity_binary, data = request
         elif len(request) == req_parts:
-            identity_binary, _, pickled_packet = request
+            identity_binary, _, data = request
         else:
-            self.handle_packet_error(request[0], f"Requests can only have 2 or 3 parts, not {len(request)}")
+            self.handle_packet_error(
+                request[0], ErrorCode.MALFORMED_PACKET, f"Requests can only have 2 or 3 parts, not {len(request)}"
+            )
             return None, None
 
-        packet = pickle.loads(pickled_packet)
+        packet = decode(data)
         logger.info("Received packet from %s: %s", identity_binary, packet)
         return identity_binary, packet
 
@@ -138,19 +141,16 @@ class Router:
             raise RuntimeError(msg)
 
         logger.info("Sending packet to %s | Packet: %s", packet.destination, packet)
-        self.socket.send_multipart([destination, b"", pickle.dumps(packet)])
+        self.socket.send_multipart([destination, b"", encode(packet)])
         logger.info("Packet sent to %s", packet.destination)
 
-    # TODO: This should reply with a standard, error in your packet message to whoever sent the packet instead of
-    #  just logging.
-    def handle_packet_error(self, destination: bytes, message: str) -> None:
+    def handle_packet_error(self, destination: bytes, code: ErrorCode, message: str) -> None:
         logger.error(message)
         error_packet = Packet(
             intent=PacketIntent.ERROR,
-            request="ERROR",
+            request=Request.ERROR,
             source=self.name,
             destination=destination.decode("utf-8"),
-            hops=0,
-            payload=message,
+            payload=ErrorPayload(code=code, message=message, origin=self.name).model_dump(),
         )
         self._send(destination, error_packet)
