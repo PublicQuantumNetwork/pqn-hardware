@@ -193,11 +193,11 @@ class RotatorInstrument(Instrument, Protocol):
 
     def move_to(self, angle: float) -> None:
         """Move the rotator to the specified angle."""
-        self.degrees = angle
+        self.degrees = angle + self.offset_degrees
 
     def move_by(self, angle: float) -> None:
         """Move the rotator by the specified angle."""
-        self.degrees += angle
+        self.degrees += angle + self.offset_degrees
 
 
 @dataclass(frozen=True, slots=True)
