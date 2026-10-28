@@ -6,6 +6,7 @@ from typing import Any
 
 from pydantic import BaseModel
 from pydantic import Field
+from pydantic import ValidationError
 
 PROTOCOL_VERSION = 2
 
@@ -156,7 +157,13 @@ def encode(packet: Packet) -> bytes:
 
 def decode(data: bytes) -> Packet:
     """Decode wire bytes into a Packet. Raises if the bytes are not a valid Packet."""
-    return Packet.model_validate_json(data)
+    packet = Packet.model_validate_json(data)
+    # A missing version on the wire fails validation: the model default only keeps local
+    # construction simple, so the wire always carries the version explicitly.
+    if "version" not in packet.model_fields_set:
+        title = "Packet"
+        raise ValidationError.from_exception_data(title, [{"type": "missing", "loc": ("version",), "input": data}])
+    return packet
 
 
 def create_registration_packet(*, source: str, destination: str, kind: NetworkElementClass, hops: int = 0) -> Packet:
